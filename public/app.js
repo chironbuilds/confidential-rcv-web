@@ -284,6 +284,65 @@ function validateSetup() {
   return { winners, endUtc };
 }
 
+// ---------- optional: sign election creation with the initiator's own wallet ----------
+let initiatorAccount = null;
+
+document.querySelectorAll('input[name="init-signer"]').forEach((el) =>
+  el.addEventListener('change', () => {
+    const useWallet = $('init-signer-wallet').checked;
+    $('init-wallet-row').hidden = !useWallet;
+    $('init-signer-hint').textContent = useWallet
+      ? "Your wallet pays the fee and is recorded as this election's initiator (only the initiator can end the vote early) — this server never sees your keys."
+      : "The server's own account pays the fee and is recorded as this election's initiator — simplest, no wallet needed.";
+  }),
+);
+
+$('btn-init-connect').addEventListener('click', async () => {
+  if (!window.tari) {
+    log('No Tari wallet found — install Sapient or open this page from inside Tari Universe.', 'err');
+    return;
+  }
+  try {
+    const [account] = await window.tari.request({ method: 'tari_requestAccounts' });
+    initiatorAccount = account;
+    $('init-wallet-account').textContent = `connected: ${account.slice(0, 14)}…${account.slice(-8)}`;
+  } catch (e) {
+    log(`wallet connect failed: ${e?.message || e}`, 'err');
+  }
+});
+
+// Same create -> poll -> submit dance the voter page uses.
+async function submitTransactionRequest(params) {
+  const { requestId } = await window.tari.request({ method: 'tari_createTransactionRequest', params });
+  let record;
+  for (;;) {
+    record = await window.tari.request({ method: 'tari_getTransactionRequest', params: { requestId } });
+    if (record.status !== 'pending') break;
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  if (record.status === 'rejected') throw new Error('Rejected in the wallet.');
+  if (record.status === 'failed') throw new Error(record.error || 'The wallet reported an error.');
+  return record.status === 'submitted' ? record.result : await window.tari.request({ method: 'tari_submitTransactionRequest', params: { requestId } });
+}
+
+// A `kind: "instructions"` result is the *raw* indexer response (just `{ result: {...} }`, no
+// top-level id at all) -- unlike the custom stealth-redemption kinds, which return a convenient
+// `{ transactionId }` directly. Dig the hash out of the one place it actually lives.
+function extractTransactionId(result) {
+  return result?.transactionId ?? result?.result?.Finalized?.execution_result?.finalize?.transaction_hash ?? null;
+}
+
+function showElectionResult(e) {
+  state.currentElection = e;
+  $('init-result').hidden = false;
+  $('res-component').textContent = e.componentAddress;
+  $('res-resource').textContent = e.ballotResource;
+  $('res-txid').textContent = e.txId || '—';
+  $('res-vote-link').value = `${location.origin}/vote?election=${e.id}`;
+  renderBallotTable(e);
+  loadElectionOptions();
+}
+
 $('btn-initiate').addEventListener('click', async () => {
   let opts;
   try {
@@ -293,30 +352,46 @@ $('btn-initiate').addEventListener('click', async () => {
     alert(e.message);
     return;
   }
+  const useWallet = $('init-signer-wallet').checked;
+  if (useWallet && !initiatorAccount) {
+    alert('Connect your wallet first.');
+    return;
+  }
+
   $('btn-initiate').disabled = true;
   $('init-progress').hidden = false;
-  $('init-progress').textContent = 'submitting — minting stealth ballots, creating component…';
+  const body = {
+    title: $('in-title').value.trim(),
+    tallyMethod: $('in-method').value,
+    numWinners: opts.winners,
+    numCandidates: state.candidates.length,
+    candidates: state.candidates,
+    voters: state.voters,
+    endUtc: opts.endUtc,
+  };
   try {
-    const body = {
-      title: $('in-title').value.trim(),
-      tallyMethod: $('in-method').value,
-      numWinners: opts.winners,
-      numCandidates: state.candidates.length,
-      candidates: state.candidates,
-      voters: state.voters,
-      endUtc: opts.endUtc,
-    };
-    const e = await api('/api/elections', { method: 'POST', body });
-    log(`election created: <code>${e.componentAddress}</code>`);
-    state.currentElection = e;
-    $('init-result').hidden = false;
-    $('res-component').textContent = e.componentAddress;
-    $('res-resource').textContent = e.ballotResource;
-    $('res-txid').textContent = e.txId || '—';
-    renderBallotTable(e);
-    loadElectionOptions();
+    if (useWallet) {
+      $('init-progress').textContent = 'preparing the transaction…';
+      const prep = await api('/api/elections/prepare', { method: 'POST', body });
+      $('init-progress').textContent = 'waiting for wallet approval…';
+      const result = await submitTransactionRequest({ kind: 'instructions', instructions: prep.instructions, maxFee: prep.maxFee });
+      const transactionId = extractTransactionId(result);
+      if (!transactionId) throw new Error(`Wallet accepted the transaction but returned no transaction id: ${JSON.stringify(result).slice(0, 300)}`);
+      $('init-progress').textContent = 'confirming on-chain…';
+      const e = await api('/api/elections/finalize', {
+        method: 'POST',
+        body: { transactionId, draft: prep.draft, ballots: prep.ballots },
+      });
+      log(`election created via wallet: <code>${e.componentAddress}</code>`);
+      showElectionResult(e);
+    } else {
+      $('init-progress').textContent = 'submitting — minting stealth ballots, creating component…';
+      const e = await api('/api/elections', { method: 'POST', body });
+      log(`election created: <code>${e.componentAddress}</code>`);
+      showElectionResult(e);
+    }
     openStep('step-monitor');
-    await loadElection(e.id);
+    await loadElection(state.currentElection.id);
   } catch (err) {
     $('init-progress').textContent = '';
     $('init-progress').hidden = true;
@@ -327,14 +402,16 @@ $('btn-initiate').addEventListener('click', async () => {
   }
 });
 
+// No voter address column -- the server never stores or serves one (see server.mjs). A voter
+// finds their own ballot by connecting their wallet on the voting page and scanning the chain,
+// not by looking up their address in a table this server keeps.
 function renderBallotTable(e) {
   const t = $('ballot-table');
-  t.innerHTML = '<tr><th>#</th><th>Voter address</th><th>Ballot commitment</th><th>Sender nonce</th></tr>';
+  t.innerHTML = '<tr><th>#</th><th>Ballot commitment</th><th>Sender nonce</th></tr>';
   e.voters.forEach((v, i) => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${i}</td>
-      <td><code>${v.address}</code></td>
       <td><code>${v.commitment}</code> <button class="copy" data-copy="${v.commitment}" title="copy">⧉</button></td>
       <td><code>${v.nonce}</code> <button class="copy" data-copy="${v.nonce}" title="copy">⧉</button></td>`;
     t.appendChild(tr);
@@ -344,12 +421,18 @@ function renderBallotTable(e) {
   );
 }
 
+$('btn-copy-vote-link').addEventListener('click', async () => {
+  const ok = await navigator.clipboard?.writeText($('res-vote-link').value).then(() => true, () => false);
+  $('btn-copy-vote-link').textContent = ok ? 'Copied ✓' : 'Copy failed';
+  setTimeout(() => ($('btn-copy-vote-link').textContent = 'Copy link'), 1500);
+});
+
 $('btn-ballots-csv').addEventListener('click', () => {
   const e = state.currentElection;
   if (!e) return;
-  const lines = ['index,address,ballot_commitment,sender_nonce'];
+  const lines = ['index,ballot_commitment,sender_nonce'];
   e.voters.forEach((v, i) => {
-    lines.push(`${i},${v.address},${v.commitment},${v.nonce}`);
+    lines.push(`${i},${v.commitment},${v.nonce}`);
   });
   const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
   const a = document.createElement('a');

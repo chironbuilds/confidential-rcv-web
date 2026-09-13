@@ -10,8 +10,10 @@ import { generateOotleSecretKey } from '@tari-project/ootle-wasm';
 import {
   currentEpoch,
   endVote,
+  finalizeInitiateElection,
   initiateElection,
   makeContext,
+  prepareInitiateElection,
   readElectionState,
   setupAccount,
 } from './lib/chain.mjs';
@@ -150,6 +152,10 @@ const server = createServer(async (req, res) => {
     if ((req.method === 'GET' || req.method === 'HEAD') && (p === '/' || p === '/index.html')) return serveStatic(req, res, 'index.html');
     if ((req.method === 'GET' || req.method === 'HEAD') && p === '/app.js') return serveStatic(req, res, 'app.js');
     if ((req.method === 'GET' || req.method === 'HEAD') && p === '/style.css') return serveStatic(req, res, 'style.css');
+    // Separate, minimal-input voter page -- linked from the initiator console after an election is
+    // created, never requires typing a component/resource/commitment by hand (see vote.js).
+    if ((req.method === 'GET' || req.method === 'HEAD') && (p === '/vote' || p === '/vote.html')) return serveStatic(req, res, 'vote.html');
+    if ((req.method === 'GET' || req.method === 'HEAD') && p === '/vote.js') return serveStatic(req, res, 'vote.js');
 
     // status
     if (req.method === 'GET' && p === '/api/status') {
@@ -172,8 +178,8 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 200, { txId: res2?.transaction_id ?? null, account: ctx.account });
     }
 
-    // create + initiate election
-    if (req.method === 'POST' && p === '/api/elections') {
+    // Shared parsing/validation for all three "create an election" entry points below.
+    if (req.method === 'POST' && (p === '/api/elections' || p === '/api/elections/prepare')) {
       const body = JSON.parse((await readBody(req)) || '{}');
       const title = String(body.title || 'Untitled election').slice(0, 200);
       const tallyMethod = body.tallyMethod === 'stv' ? 'stv' : body.tallyMethod === 'sequential-irv' ? 'sequential-irv' : 'irv';
@@ -199,37 +205,85 @@ const server = createServer(async (req, res) => {
       if (voterAddresses.length !== (Array.isArray(body.voters) ? body.voters.length : 0)) {
         throw new Error('invalid voter addresses (must be otl_esm_... ootle addresses)');
       }
+      const parsed = { title, tallyMethod, numWinners, numCandidates, candidates, voterAddresses, epoch, expiresInEpochs, expiresAtEpoch };
 
-      const initiated = await initiateElection(ctx, cfg, {
-        voterAddresses,
-        numCandidates,
-        numWinners,
-        tallyMethod,
-        expiresAtEpoch,
-      });
+      // This server's own account signs and submits -- unchanged, still the simplest path for
+      // anyone happy to let the server hold a key.
+      if (p === '/api/elections') {
+        const initiated = await initiateElection(ctx, cfg, parsed);
+        const record = {
+          id: randomUUID(),
+          title,
+          createdAt: new Date().toISOString(),
+          componentAddress: initiated.componentAddress,
+          ballotResource: initiated.ballotResource,
+          templateAddress: cfg.TEMPLATE_ADDRESS,
+          tallyMethod,
+          numWinners,
+          numCandidates,
+          candidates,
+          // Deliberately never keeps the voter's address alongside the commitment: once the
+          // ballot is minted, this server has no further legitimate need for an
+          // address<->commitment mapping, and retaining one would be exactly the kind of
+          // centrally-held deanonymization risk a stealth ballot scheme exists to avoid. Voters
+          // find their own ballot later by connecting their own wallet and scanning the chain
+          // (see public/vote.js), never by asking this server "which one is mine."
+          voters: voterAddresses.map((_a, i) => ({
+            commitment: initiated.ballots[i].commitment,
+            nonce: initiated.ballots[i].nonce,
+          })),
+          expiresAtEpoch,
+          expiresInEpochs,
+          expiresAtUtc: epochToUtc(expiresAtEpoch, epoch),
+          status: 'open',
+          txId: initiated.txId,
+          events: initiated.events,
+        };
+        elections.push(record);
+        saveElections(elections);
+        return sendJson(res, 200, publicElection(record));
+      }
 
+      // /api/elections/prepare: build the unsigned instructions only. Building the mint
+      // statement needs no secret key (see chain.mjs's own comment), so this is safe to hand to
+      // whichever wallet the browser has connected -- see /api/elections/finalize below for the
+      // other half, once that wallet has signed and submitted them.
+      const prepared = await prepareInitiateElection(ctx, cfg, parsed);
+      return sendJson(res, 200, { instructions: prepared.instructions, ballots: prepared.ballots, maxFee: '2000000', draft: parsed });
+    }
+
+    // The initiator's own wallet (via window.tari) has already signed and submitted the
+    // instructions /api/elections/prepare returned; this reads the committed receipt back and
+    // stores the election record, exactly like /api/elections does for the server's own account.
+    if (req.method === 'POST' && p === '/api/elections/finalize') {
+      const body = JSON.parse((await readBody(req)) || '{}');
+      const { transactionId, draft, ballots } = body;
+      if (!transactionId) throw new Error('transactionId is required');
+      if (!draft || !Array.isArray(ballots)) throw new Error('draft and ballots (from /api/elections/prepare) are required');
+      const finalized = await finalizeInitiateElection(ctx, transactionId);
       const record = {
         id: randomUUID(),
-        title,
+        title: draft.title,
         createdAt: new Date().toISOString(),
-        componentAddress: initiated.componentAddress,
-        ballotResource: initiated.ballotResource,
+        componentAddress: finalized.componentAddress,
+        ballotResource: finalized.ballotResource,
         templateAddress: cfg.TEMPLATE_ADDRESS,
-        tallyMethod,
-        numWinners,
-        numCandidates,
-        candidates,
-        voters: voterAddresses.map((a, i) => ({
-          address: a,
-          commitment: initiated.ballots[i].commitment,
-          nonce: initiated.ballots[i].nonce,
+        tallyMethod: draft.tallyMethod,
+        numWinners: draft.numWinners,
+        numCandidates: draft.numCandidates,
+        candidates: draft.candidates,
+        // See the identical comment in the /api/elections branch above -- no address is stored
+        // here either, for the same reason.
+        voters: draft.voterAddresses.map((_a, i) => ({
+          commitment: ballots[i].commitment,
+          nonce: ballots[i].nonce,
         })),
-        expiresAtEpoch,
-        expiresInEpochs,
-        expiresAtUtc: epochToUtc(expiresAtEpoch, epoch),
+        expiresAtEpoch: draft.expiresAtEpoch,
+        expiresInEpochs: draft.expiresInEpochs,
+        expiresAtUtc: epochToUtc(draft.expiresAtEpoch, draft.epoch),
         status: 'open',
-        txId: initiated.txId,
-        events: initiated.events,
+        txId: finalized.txId,
+        events: finalized.events,
       };
       elections.push(record);
       saveElections(elections);
