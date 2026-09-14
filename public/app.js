@@ -2,6 +2,7 @@
 // Talks only to the same-origin backend API.
 
 const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const state = {
   currentElection: null,
   status: null,
@@ -255,14 +256,14 @@ function renderSummary() {
     ['Title', state.status?.network || '…'],
     ['Voting method', $('in-method').selectedOptions[0].textContent],
     ['Winners', $('in-winners').value],
-    ['Candidates', state.candidates.length ? state.candidates.map((c, i) => `#${i} ${c}`).join('<br>') : '—'],
+    ['Candidates', state.candidates.length ? state.candidates.map((c, i) => esc(`#${i} ${c}`)).join('<br>') : '—'],
     ['Voters', `${state.voters.length} address(es)`],
     ['Voting deadline (UTC)', deadlineSummary()],
   ];
   rows[0][1] = $('in-title').value || '(untitled)';
   for (const [k, v] of rows) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${k}</td><td>${v}</td>`;
+    tr.innerHTML = `<td>${esc(k)}</td><td>${v}</td>`;
     t.appendChild(tr);
   }
 }
@@ -324,19 +325,7 @@ $('btn-init-connect').addEventListener('click', async () => {
   }
 });
 
-// Same create -> poll -> submit dance the voter page uses.
-async function submitTransactionRequest(params) {
-  const { requestId } = await window.tari.request({ method: 'tari_createTransactionRequest', params });
-  let record;
-  for (;;) {
-    record = await window.tari.request({ method: 'tari_getTransactionRequest', params: { requestId } });
-    if (record.status !== 'pending') break;
-    await new Promise((r) => setTimeout(r, 1500));
-  }
-  if (record.status === 'rejected') throw new Error('Rejected in the wallet.');
-  if (record.status === 'failed') throw new Error(record.error || 'The wallet reported an error.');
-  return record.status === 'submitted' ? record.result : await window.tari.request({ method: 'tari_submitTransactionRequest', params: { requestId } });
-}
+// The create -> poll -> submit helper lives in wallet.js (shared with the voting page).
 
 // A `kind: "instructions"` result is the *raw* indexer response (just `{ result: {...} }`, no
 // top-level id at all) -- unlike the custom stealth-redemption kinds, which return a convenient
@@ -387,7 +376,7 @@ $('btn-initiate').addEventListener('click', async () => {
       $('init-progress').textContent = 'preparing the transaction…';
       const prep = await api('/api/elections/prepare', { method: 'POST', body });
       $('init-progress').textContent = 'waiting for wallet approval…';
-      const result = await submitTransactionRequest({ kind: 'instructions', instructions: prep.instructions, maxFee: prep.maxFee });
+      const result = await window.RcvWallet.submitTransactionRequest({ kind: 'instructions', instructions: prep.instructions, maxFee: prep.maxFee });
       const transactionId = extractTransactionId(result);
       if (!transactionId) throw new Error(`Wallet accepted the transaction but returned no transaction id: ${JSON.stringify(result).slice(0, 300)}`);
       $('init-progress').textContent = 'confirming on-chain…';
@@ -632,6 +621,10 @@ function candidateName(id) {
   return c && Number(id) < c.length ? c[Number(id)] : `Candidate ${id}`;
 }
 
+// Candidate names are user-supplied (election creator's own input) but still end up in
+// innerHTML-driven tables; escape every place they are interpolated.
+const candidateNameEsc = (id) => esc(candidateName(id));
+
 function renderResult(result, schema = 'v2') {
   const el = $('m-results');
   $('m-raw-pre').textContent = JSON.stringify(result, null, 2);
@@ -641,19 +634,19 @@ function renderResult(result, schema = 'v2') {
   if (!r) {
     html = '<p class="hint">Unrecognised result shape — see raw JSON below.</p>';
   } else if (r.kind === 'Fptp') {
-    html = `<h4>Winner</h4><p class="winner">${r.winner != null ? candidateName(r.winner) : 'no winner'}</p>`;
+    html = `<h4>Winner</h4><p class="winner">${r.winner != null ? candidateNameEsc(r.winner) : 'no winner'}</p>`;
     html += '<h4>First-preference counts</h4>' + fptpCountsTable(r.counts, r.winner);
   } else if (r.kind === 'Irv') {
-    html = `<h4>Winner</h4><p class="winner">${r.winner != null ? candidateName(r.winner) : 'no winner'}</p>`;
+    html = `<h4>Winner</h4><p class="winner">${r.winner != null ? candidateNameEsc(r.winner) : 'no winner'}</p>`;
     html += '<h4>Rounds</h4>' + roundsTable(r.rounds, r.winner != null);
   } else if (r.kind === 'SequentialIrv') {
-    html = `<h4>Winners</h4><p class="winner">${r.winners.length ? r.winners.map(candidateName).join(', ') : 'none'}</p>`;
+    html = `<h4>Winners</h4><p class="winner">${r.winners.length ? r.winners.map(candidateNameEsc).join(', ') : 'none'}</p>`;
     r.seats.forEach((seat, i) => {
-      html += `<h4>Seat ${i + 1}${seat.winner != null ? ' — winner ' + candidateName(seat.winner) : ''}</h4>`;
+      html += `<h4>Seat ${i + 1}${seat.winner != null ? ' — winner ' + candidateNameEsc(seat.winner) : ''}</h4>`;
       html += roundsTable(seat.irv_rounds, seat.winner != null);
     });
   } else if (r.kind === 'Stv') {
-    html = `<h4>Winners (elected in order)</h4><p class="winner">${r.winners.length ? r.winners.map(candidateName).join(', ') : 'none'}</p>`;
+    html = `<h4>Winners (elected in order)</h4><p class="winner">${r.winners.length ? r.winners.map(candidateNameEsc).join(', ') : 'none'}</p>`;
     html += stvRoundsTable(r.rounds);
   }
   el.innerHTML = html;
@@ -664,7 +657,7 @@ function fptpCountsTable(counts, winner) {
   let html = '<table class="round-table"><tr><th>Candidate</th><th>First-preference votes</th><th></th></tr>';
   for (const c of order) {
     const isWinner = winner != null && c === winner;
-    html += `<tr><td>${candidateName(c)}</td><td>${counts[c] ?? 0}</td><td class="${isWinner ? 'winner' : ''}">${isWinner ? 'winner' : ''}</td></tr>`;
+    html += `<tr><td>${candidateNameEsc(c)}</td><td>${counts[c] ?? 0}</td><td class="${isWinner ? 'winner' : ''}">${isWinner ? 'winner' : ''}</td></tr>`;
   }
   return html + '</table>';
 }
@@ -675,7 +668,7 @@ function roundsTable(rounds, hasWinner = true) {
   for (const r of rounds) Object.keys(normCounts(r.counts)).forEach((c) => cands.add(Number(c)));
   const order = [...cands].sort((a, b) => a - b);
   let html = '<table class="round-table"><tr><th>Round</th>';
-  for (const c of order) html += `<th>${candidateName(c)}</th>`;
+  for (const c of order) html += `<th>${candidateNameEsc(c)}</th>`;
   html += '<th>Action</th></tr>';
   rounds.forEach((r, i) => {
     const counts = normCounts(r.counts);
@@ -686,7 +679,7 @@ function roundsTable(rounds, hasWinner = true) {
     const final = r.eliminated == null;
     const action = final
       ? hasWinner ? 'winner' : 'no winner'
-      : `eliminated ${candidateName(r.eliminated)}`;
+      : `eliminated ${candidateNameEsc(r.eliminated)}`;
     const cls = final ? (hasWinner ? 'winner' : '') : 'elim';
     html += `<td class="${cls}">${action}</td></tr>`;
   });
@@ -699,15 +692,15 @@ function stvRoundsTable(rounds) {
   for (const r of rounds) Object.keys(normCounts(r.counts)).forEach((c) => cands.add(Number(c)));
   const order = [...cands].sort((a, b) => a - b);
   let html = '<table class="round-table"><tr><th>Round</th>';
-  for (const c of order) html += `<th>${candidateName(c)}</th>`;
+  for (const c of order) html += `<th>${candidateNameEsc(c)}</th>`;
   html += '<th>Action</th></tr>';
   rounds.forEach((r, i) => {
     const counts = normCounts(r.counts);
     html += `<tr><td>${i + 1}</td>`;
     for (const c of order) html += `<td>${counts[c] ?? '·'}</td>`;
     const acts = [];
-    if (r.elected?.length) acts.push(`elected ${r.elected.map(candidateName).join(', ')}`);
-    if (r.eliminated != null) acts.push(`eliminated ${candidateName(r.eliminated)}`);
+    if (r.elected?.length) acts.push(`elected ${r.elected.map(candidateNameEsc).join(', ')}`);
+    if (r.eliminated != null) acts.push(`eliminated ${candidateNameEsc(r.eliminated)}`);
     if (!acts.length) acts.push('—');
     html += `<td>${acts.join('; ')}</td></tr>`;
   });

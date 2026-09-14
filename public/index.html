@@ -132,8 +132,9 @@
           </div>
           <h3>Ballot commitments minted</h3>
           <p class="hint">
-            <strong>This server never stores or shows which address got which ballot</strong> — only
-            the commitments below, with no address attached. Voters find their own ballot by
+            <strong>This server does not store or serve the address↔ballot mapping</strong> — it
+            only processes the voter addresses once, while building the mint statement, and keeps
+            just the commitments below with no address attached. Voters find their own ballot by
             connecting their wallet on the voting page and scanning the chain, never by asking this
             server "which one is mine." This table is just a record of what was minted, for your own
             bookkeeping.
@@ -207,6 +208,7 @@
     <p>Everything runs on-chain on the Esmeralda testnet. Voter identity is hidden by stealth ballots; ballot contents and the tally are public.</p>
   </footer>
 
+  <script src="/wallet.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

@@ -5,7 +5,7 @@ const $ = (id) => document.getElementById(id);
 
 const XTR_RESOURCE = 'resource_0101010101010101010101010101010101010101010101010101010101010101';
 const FEE_SHIELD_AMOUNT = '500000';
-const FEE_MAX_FEE = '50000';
+const FEE_MAX_FEE = '100000';
 const FEE_COMMITMENT_KEY = 'rcv-voter-fee-commitment';
 // Every ballot the template mints is worth exactly 1 unit ("one amount-1 stealth ballot UTXO per
 // voter" — see the mint statement in lib/mint.mjs), so this is a fixed constant, not user input.
@@ -84,18 +84,7 @@ function currentRanking() {
   return Array.from($('v-rank-list').querySelectorAll('li')).map((li) => Number(li.dataset.id));
 }
 
-async function submitTransactionRequest(params) {
-  const { requestId } = await window.tari.request({ method: 'tari_createTransactionRequest', params });
-  let record;
-  for (;;) {
-    record = await window.tari.request({ method: 'tari_getTransactionRequest', params: { requestId } });
-    if (record.status !== 'pending') break;
-    await new Promise((r) => setTimeout(r, 1500));
-  }
-  if (record.status === 'rejected') throw new Error('Rejected in the wallet.');
-  if (record.status === 'failed') throw new Error(record.error || 'The wallet reported an error.');
-  return record.status === 'submitted' ? record.result : await window.tari.request({ method: 'tari_submitTransactionRequest', params: { requestId } });
-}
+// The create -> poll -> submit helper lives in wallet.js (shared with the initiator console).
 
 // ---------- load the election ----------
 async function loadElection(id) {
@@ -105,6 +94,15 @@ async function loadElection(id) {
     $('v-not-found').hidden = true;
     $('v-title').textContent = e.title;
     renderRankList(e.candidates);
+    const closed = e.status === 'ended' || (e.epoch != null && e.expiresAtEpoch != null && e.epoch > e.expiresAtEpoch);
+    if (closed) {
+      $('v-scan-row').hidden = true;
+      $('v-ballot-fields').hidden = true;
+      $('v-not-eligible').hidden = false;
+      $('v-not-eligible').textContent = 'This election is closed — no more ballots can be cast.';
+      return;
+    }
+    $('v-not-eligible').textContent = 'No ballot for this election\'s ballot resource was found in your wallet.';
     if (voterAccount) await scanForBallot();
   } catch {
     $('v-not-found').hidden = false;
@@ -192,6 +190,22 @@ async function scanForBallot() {
       return false;
     }
     ballotCommitment = match.commitment;
+    // The wallet may still hold a record of a ballot that was already spent (a previous
+    // visit). Ask the chain whether the output is still live before offering the cast.
+    try {
+      const res = await window.tari.request({
+        method: 'tari_getSubstate',
+        params: { substateId: `utxo_${election.ballotResource.replace('resource_', '')}_${ballotCommitment}`, version: null },
+      });
+      const utxo = res?.substate?.Utxo;
+      if (!utxo || !utxo.output) throw new Error('spent');
+    } catch {
+      $('v-scan-status').textContent = '';
+      $('v-ballot-fields').hidden = true;
+      $('v-not-eligible').hidden = false;
+      $('v-not-eligible').textContent = 'This ballot has already been spent — you appear to have voted already.';
+      return false;
+    }
     $('v-scan-status').textContent = 'ballot found ✓';
     $('v-ballot-fields').hidden = false;
     $('btn-vote-cast').disabled = false;
@@ -268,7 +282,7 @@ $('btn-vote-shield-fee').addEventListener('click', async () => {
   $('btn-vote-shield-fee').disabled = true;
   $('v-fee-status').textContent = 'shielding XTR for fees — waiting on wallet approval…';
   try {
-    const result = await submitTransactionRequest({ kind: 'shield', resourceAddress: XTR_RESOURCE, amount: FEE_SHIELD_AMOUNT });
+    const result = await window.RcvWallet.submitTransactionRequest({ kind: 'shield', resourceAddress: XTR_RESOURCE, amount: FEE_SHIELD_AMOUNT });
     $('v-fee-commitment').value = result.commitment;
     try {
       localStorage.setItem(FEE_COMMITMENT_KEY, result.commitment);
@@ -293,10 +307,6 @@ $('btn-vote-cast').addEventListener('click', async () => {
     return;
   }
   const ranking = currentRanking();
-  if (!ranking.length) {
-    voterError('Rank at least one candidate.');
-    return;
-  }
   const feeCommitmentHex = $('v-fee-commitment').value.trim().replace(/^0x/, '');
   if (!feeCommitmentHex) {
     voterError('This needs a stealth XTR UTXO to pay the fee from — click "Shield XTR for fees".');
@@ -321,7 +331,7 @@ $('btn-vote-cast').addEventListener('click', async () => {
     // Always paid privately -- see the fee field's own hint: any other way links this transaction
     // (including your ranking) to your wallet address on-chain.
     if (!caps.stealthRedeemPrivateFee) throw new Error('This wallet cannot pay fees privately yet — update it.');
-    const result = await submitTransactionRequest({
+    const result = await window.RcvWallet.submitTransactionRequest({
       kind: 'redeemStealthOutputWithPrivateFee',
       resourceAddress: election.ballotResource,
       commitmentHex: ballotCommitment,
@@ -357,5 +367,7 @@ const electionId = params.get('election');
 if (electionId) {
   loadElection(electionId);
 } else {
-  populatePicker();
+  populatePicker().catch((e) => {
+    voterError(e?.message || String(e));
+  });
 }

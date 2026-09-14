@@ -16,6 +16,7 @@ import {
   prepareInitiateElection,
   readElectionState,
   setupAccount,
+  verifyElectionCreation,
 } from './lib/chain.mjs';
 
 const ROOT = import.meta.dirname;
@@ -157,6 +158,7 @@ const server = createServer(async (req, res) => {
     // created, never requires typing a component/resource/commitment by hand (see vote.js).
     if ((req.method === 'GET' || req.method === 'HEAD') && (p === '/vote' || p === '/vote.html')) return serveStatic(req, res, 'vote.html');
     if ((req.method === 'GET' || req.method === 'HEAD') && p === '/vote.js') return serveStatic(req, res, 'vote.js');
+    if ((req.method === 'GET' || req.method === 'HEAD') && p === '/wallet.js') return serveStatic(req, res, 'wallet.js');
 
     // status
     if (req.method === 'GET' && p === '/api/status') {
@@ -206,6 +208,9 @@ const server = createServer(async (req, res) => {
       if (voterAddresses.length < 1) throw new Error('at least one voter address required');
       if (voterAddresses.length !== (Array.isArray(body.voters) ? body.voters.length : 0)) {
         throw new Error('invalid voter addresses (must be otl_esm_... ootle addresses)');
+      }
+      if (voterAddresses.length > 5000) {
+        throw new Error('too many voters (max 5000)');
       }
       const parsed = { title, tallyMethod, numWinners, numCandidates, candidates, voterAddresses, epoch, expiresInEpochs, expiresAtEpoch };
 
@@ -263,27 +268,63 @@ const server = createServer(async (req, res) => {
       const { transactionId, draft, ballots } = body;
       if (!transactionId) throw new Error('transactionId is required');
       if (!draft || !Array.isArray(ballots)) throw new Error('draft and ballots (from /api/elections/prepare) are required');
+      if (!cfg.TEMPLATE_ADDRESS) throw new Error('TEMPLATE_ADDRESS not configured');
+      // The client could have tampered with the draft between /prepare and /finalize, so
+      // re-validate it here rather than trusting the round-trip.
+      const draftVoters = Array.isArray(draft.voterAddresses) ? draft.voterAddresses.map((v) => String(v).trim()) : [];
+      const validated = {
+        title: String(draft.title || 'Untitled election').slice(0, 200),
+        tallyMethod: ['stv', 'sequential-irv', 'fptp'].includes(draft.tallyMethod) ? draft.tallyMethod : null,
+        numWinners: Math.floor(Number(draft.numWinners) || 0),
+        numCandidates: Math.floor(Number(draft.numCandidates) || 0),
+        candidates: Array.isArray(draft.candidates) ? draft.candidates.map(String).slice(0, 50) : [],
+        voterAddresses: draftVoters.filter((v) => /^otl_esm_/.test(v)),
+        expiresInEpochs: Math.floor(Number(draft.expiresInEpochs) || 0),
+        expiresAtEpoch: Math.floor(Number(draft.expiresAtEpoch) || 0),
+        epoch: Math.floor(Number(draft.epoch) || 0),
+      };
+      if (!validated.tallyMethod) throw new Error('invalid draft tally method');
+      if (validated.numCandidates < 2) throw new Error('invalid draft: at least 2 candidates required');
+      if (validated.numWinners < 1 || validated.numWinners > validated.numCandidates) {
+        throw new Error('invalid draft: numWinners out of range');
+      }
+      if (validated.tallyMethod === 'fptp' && validated.numWinners !== 1) {
+        throw new Error('invalid draft: FPTP is single-winner');
+      }
+      if (validated.voterAddresses.length < 1 || validated.voterAddresses.length > 5000) {
+        throw new Error('invalid draft: voter count out of range');
+      }
+      if (validated.voterAddresses.length !== draftVoters.length) {
+        throw new Error('invalid draft: bad voter addresses');
+      }
+      if (!validated.expiresAtEpoch || !validated.epoch) throw new Error('invalid draft: expiry missing');
+      // The authoritative check: the committed transaction must really be this template's
+      // new() call for this draft, minting exactly these ballots.
+      await verifyElectionCreation(ctx, cfg, transactionId, validated, ballots);
       const finalized = await finalizeInitiateElection(ctx, transactionId);
+      if (elections.some((e) => e.componentAddress === finalized.componentAddress)) {
+        throw new Error('election already recorded');
+      }
       const record = {
         id: randomUUID(),
-        title: draft.title,
+        title: validated.title,
         createdAt: new Date().toISOString(),
         componentAddress: finalized.componentAddress,
         ballotResource: finalized.ballotResource,
         templateAddress: cfg.TEMPLATE_ADDRESS,
-        tallyMethod: draft.tallyMethod,
-        numWinners: draft.numWinners,
-        numCandidates: draft.numCandidates,
-        candidates: draft.candidates,
+        tallyMethod: validated.tallyMethod,
+        numWinners: validated.numWinners,
+        numCandidates: validated.numCandidates,
+        candidates: validated.candidates,
         // See the identical comment in the /api/elections branch above -- no address is stored
         // here either, for the same reason.
-        voters: draft.voterAddresses.map((_a, i) => ({
+        voters: validated.voterAddresses.map((_a, i) => ({
           commitment: ballots[i].commitment,
           nonce: ballots[i].nonce,
         })),
-        expiresAtEpoch: draft.expiresAtEpoch,
-        expiresInEpochs: draft.expiresInEpochs,
-        expiresAtUtc: epochToUtc(draft.expiresAtEpoch, draft.epoch),
+        expiresAtEpoch: validated.expiresAtEpoch,
+        expiresInEpochs: validated.expiresInEpochs,
+        expiresAtUtc: epochToUtc(validated.expiresAtEpoch, validated.epoch),
         resultSchema: 'v2',
         status: 'open',
         txId: finalized.txId,
