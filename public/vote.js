@@ -255,19 +255,41 @@ try {
 // pick the largest existing stealth UTXO (best chance of covering the fee) and use it. Best-effort:
 // a denial or failure here just leaves whatever was already in the field (localStorage, or blank),
 // and the voter can still shield manually.
+//
+// The wallet's own record of "unspent" can be stale (e.g. a previous cast attempt that spent this
+// exact output but got interrupted before the wallet's local bookkeeping caught up, or the output
+// was already used from another session/tab) -- confirmed live 2026-09-21 as the cause of a cast
+// failing with "Input substate ... is down" using a fee commitment this same check had just handed
+// back as good. The ballot-liveness check above (tari_getSubstate before offering to cast) already
+// guards against exactly this for the ballot itself; this is the same guard for the fee input,
+// walking candidates largest-first until one is confirmed still live on-chain.
 async function checkExistingFeeShield() {
   try {
     await ensureViewAccess();
     const outputs = await window.tari.request({ method: 'tari_getShieldedOutputs', params: { resourceAddress: XTR_RESOURCE } });
     if (!outputs || outputs.length === 0) return;
-    const best = outputs.reduce((a, b) => (BigInt(b.amount) > BigInt(a.amount) ? b : a));
-    $('v-fee-commitment').value = best.commitment;
-    try {
-      localStorage.setItem(FEE_COMMITMENT_KEY, best.commitment);
-    } catch {
-      /* best-effort only */
+    const candidates = [...outputs].sort((a, b) => (BigInt(b.amount) > BigInt(a.amount) ? 1 : -1));
+    for (const candidate of candidates) {
+      try {
+        const res = await window.tari.request({
+          method: 'tari_getSubstate',
+          params: { substateId: `utxo_${XTR_RESOURCE.replace('resource_', '')}_${candidate.commitment}`, version: null },
+        });
+        if (!res?.substate?.Utxo?.output) continue; // stale record -- already spent, try the next
+        $('v-fee-commitment').value = candidate.commitment;
+        try {
+          localStorage.setItem(FEE_COMMITMENT_KEY, candidate.commitment);
+        } catch {
+          /* best-effort only */
+        }
+        $('v-fee-status').textContent = 'using your existing shielded XTR ✓';
+        return;
+      } catch {
+        continue; // not found / already spent -- try the next candidate
+      }
     }
-    $('v-fee-status').textContent = 'using your existing shielded XTR ✓';
+    // Every known output was already spent on-chain -- leave the field as-is (localStorage or
+    // blank) rather than pre-filling a doomed one; the voter shields fresh below.
   } catch {
     /* no existing shielded XTR, or the voter hasn't granted view access -- shield manually below */
   }
@@ -354,7 +376,22 @@ $('btn-vote-cast').addEventListener('click', async () => {
     $('v-result').hidden = false;
     $('v-ballot-fields').hidden = true;
   } catch (e) {
-    voterError(e?.message || String(e));
+    const msg = e?.message || String(e);
+    // "Input substate ... is down" is the indexer's wording for "already spent" -- if this exact
+    // fee commitment is the culprit, leaving it in the field (and in localStorage) just makes the
+    // next click fail the same way. Clear it and say plainly what to do instead of surfacing the
+    // raw indexer error.
+    if (/is down/i.test(msg) && msg.includes(feeCommitmentHex)) {
+      $('v-fee-commitment').value = '';
+      try {
+        localStorage.removeItem(FEE_COMMITMENT_KEY);
+      } catch {
+        /* best-effort only */
+      }
+      voterError('That shielded XTR was already spent (from an earlier attempt or elsewhere) — click "Shield XTR for fees" to get a fresh one, then cast again.');
+    } else {
+      voterError(msg);
+    }
   } finally {
     $('btn-vote-cast').disabled = false;
     $('v-progress').hidden = true;
