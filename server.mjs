@@ -298,10 +298,16 @@ const server = createServer(async (req, res) => {
         throw new Error('invalid draft: bad voter addresses');
       }
       if (!validated.expiresAtEpoch || !validated.epoch) throw new Error('invalid draft: expiry missing');
-      // The authoritative check: the committed transaction must really be this template's
-      // new() call for this draft, minting exactly these ballots.
-      await verifyElectionCreation(ctx, cfg, transactionId, validated, ballots);
+      // finalizeInitiateElection() first, not verifyElectionCreation() -- the wallet has *just*
+      // submitted this transaction, and only finalizeInitiateElection() actually waits for it to
+      // land (watchTransaction, up to 180s). verifyElectionCreation()'s getTransaction() call has
+      // no wait/retry of its own: called first, it raced the indexer and threw "does not call
+      // new() on the configured template" (instructions come back empty) whenever the indexer
+      // hadn't caught up yet -- a false verification failure, not a real mismatch. Once
+      // finalizeInitiateElection() returns, the transaction is guaranteed committed and indexed,
+      // so verifyElectionCreation() reading the same transactionId right after is safe.
       const finalized = await finalizeInitiateElection(ctx, transactionId);
+      await verifyElectionCreation(ctx, cfg, transactionId, validated, ballots);
       if (elections.some((e) => e.componentAddress === finalized.componentAddress)) {
         throw new Error('election already recorded');
       }

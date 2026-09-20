@@ -395,8 +395,10 @@ $('btn-initiate').addEventListener('click', async () => {
     openStep('step-monitor');
     await loadElection(state.currentElection.id);
   } catch (err) {
-    $('init-progress').textContent = '';
-    $('init-progress').hidden = true;
+    // Was hiding the element and *then* writing the failure text into it -- the progress line
+    // just silently disappeared on any failure (e.g. mid "confirming on-chain…"), with nothing
+    // visible to say what happened unless you happened to have the log panel open.
+    $('init-progress').hidden = false;
     $('init-progress').textContent = `failed: ${err.message}`;
     log(`initiate failed: ${err.message}`, 'err');
   } finally {
