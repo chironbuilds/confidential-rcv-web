@@ -66,7 +66,6 @@ async function refreshStatus() {
       : 'template: NOT SET';
     $('pill-template').classList.toggle('ok', !!s.templateAddress);
     $('pill-template').title = s.templateAddress || '';
-    $('btn-faucet').hidden = false;
     updateDeadlinePreview();
   } catch (e) {
     log(`status failed: ${e.message}`, 'err');
@@ -113,18 +112,6 @@ function updateDeadlinePreview() {
 }
 
 $('in-end-utc').addEventListener('input', updateDeadlinePreview);
-
-$('btn-faucet').addEventListener('click', async () => {
-  $('btn-faucet').disabled = true;
-  try {
-    const r = await api('/api/setup', { method: 'POST', body: {} });
-    log(`faucet tx: <code>${r.txId}</code> — account ${r.account}`);
-  } catch (e) {
-    log(`faucet failed: ${e.message}`, 'err');
-  } finally {
-    $('btn-faucet').disabled = false;
-  }
-});
 
 // ---------- step 1: candidates ----------
 function renderCandidates() {
