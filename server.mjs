@@ -8,6 +8,8 @@ import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { generateOotleSecretKey } from '@tari-project/ootle-wasm';
 import {
+  MAX_VOTERS,
+  accountBalance,
   currentEpoch,
   endVote,
   finalizeInitiateElection,
@@ -50,7 +52,7 @@ function loadConfig() {
 }
 
 const cfg = loadConfig();
-const ctx = makeContext(cfg);
+const ctx = await makeContext(cfg);
 
 // Approximate epoch length in seconds. Esmeralda epochs are ~20-30 min; the value is
 // configurable via EPOCH_DURATION_SECS and only used to translate between wall-clock
@@ -86,6 +88,25 @@ function saveElections(list) {
 
 let elections = loadElections();
 
+// Elections from before an Ootle network reset point at a template that no longer exists. They are
+// kept in the data file but hidden from the site.
+const isCurrent = (e) => e.templateAddress === cfg.TEMPLATE_ADDRESS;
+const visible = () => elections.filter(isCurrent);
+
+// Live state is read with four dry-runs per election; cache it briefly so many viewers polling the
+// same election do not multiply the indexer load.
+const stateCache = new Map();
+async function cachedState(e) {
+  const hit = stateCache.get(e.id);
+  if (hit && Date.now() - hit.at < 6000) return hit.value;
+  const pending = readElectionState(ctx, e.componentAddress).then(
+    (value) => (stateCache.set(e.id, { at: Date.now(), value }), value),
+    (err) => ({ error: String(err.message || err) }),
+  );
+  stateCache.set(e.id, { at: Date.now(), value: pending });
+  return pending;
+}
+
 function publicElection(e) {
   return {
     id: e.id,
@@ -104,6 +125,9 @@ function publicElection(e) {
     resultSchema: e.resultSchema ?? 'legacy',
     status: e.status,
     txId: e.txId,
+    initiator: e.initiator ?? 'server',
+    endResult: e.endResult ?? null,
+    endedAt: e.endedAt ?? null,
   };
 }
 
@@ -114,7 +138,11 @@ const MIME = {
   '.css': 'text/css',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
+  '.mjs': 'text/javascript',
 };
+const STATIC = new Set(['app.js', 'style.css', 'vote.js', 'wallet.js', 'ui.js', 'results.js', 'favicon.svg']);
+// The tally WASM is also served so browsers can recount the public ballots themselves.
+const TALLY = { '/tally/rcv_tally_wasm.js': 'text/javascript', '/tally/rcv_tally_wasm_bg.wasm': 'application/wasm' };
 
 function sendJson(res, status, obj) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -152,26 +180,29 @@ const server = createServer(async (req, res) => {
   try {
     // static
     if ((req.method === 'GET' || req.method === 'HEAD') && (p === '/' || p === '/index.html')) return serveStatic(req, res, 'index.html');
-    if ((req.method === 'GET' || req.method === 'HEAD') && p === '/app.js') return serveStatic(req, res, 'app.js');
-    if ((req.method === 'GET' || req.method === 'HEAD') && p === '/style.css') return serveStatic(req, res, 'style.css');
+    if ((req.method === 'GET' || req.method === 'HEAD') && STATIC.has(p.slice(1))) return serveStatic(req, res, p.slice(1));
+    if ((req.method === 'GET' || req.method === 'HEAD') && TALLY[p]) {
+      const data = await readFile(path.join(ROOT, 'lib', p));
+      res.writeHead(200, { 'Content-Type': TALLY[p], 'Cache-Control': 'public, max-age=3600' });
+      return res.end(data);
+    }
     // Separate, minimal-input voter page -- linked from the initiator console after an election is
     // created, never requires typing a component/resource/commitment by hand (see vote.js).
     if ((req.method === 'GET' || req.method === 'HEAD') && (p === '/vote' || p === '/vote.html')) return serveStatic(req, res, 'vote.html');
-    if ((req.method === 'GET' || req.method === 'HEAD') && p === '/vote.js') return serveStatic(req, res, 'vote.js');
-    if ((req.method === 'GET' || req.method === 'HEAD') && p === '/wallet.js') return serveStatic(req, res, 'wallet.js');
 
     // status
     if (req.method === 'GET' && p === '/api/status') {
       const epoch = await currentEpoch(ctx);
       return sendJson(res, 200, {
         network: cfg.NETWORK,
-        indexerUrl: ctx.provider.client.getTransport?.()?.url ?? 'unknown',
+        indexerUrl: ctx.indexerUrl,
         epoch,
         templateAddress: cfg.TEMPLATE_ADDRESS || null,
         walletAccount: ctx.account,
-        walletAddress: ctx.signer.address,
+        walletAddress: ctx.address,
         epochDurationSecs: EPOCH_DURATION_SECS,
-        elections: elections.length,
+        maxVoters: MAX_VOTERS,
+        elections: visible().length,
       });
     }
 
@@ -186,7 +217,7 @@ const server = createServer(async (req, res) => {
       const body = JSON.parse((await readBody(req)) || '{}');
       const title = String(body.title || 'Untitled election').slice(0, 200);
       const tallyMethod = ['stv', 'sequential-irv', 'fptp'].includes(body.tallyMethod) ? body.tallyMethod : 'irv';
-      const numWinners = Math.max(1, Math.min(100, Math.floor(Number(body.numWinners) || 1)));
+      const numWinners = ['irv', 'fptp'].includes(tallyMethod) ? 1 : Math.max(2, Math.min(100, Math.floor(Number(body.numWinners) || 2)));
       const numCandidates = Math.max(1, Math.min(50, Math.floor(Number(body.numCandidates) || 0)));
       const candidates = Array.isArray(body.candidates) ? body.candidates.map(String).slice(0, 50) : [];
       const voterAddresses = (Array.isArray(body.voters) ? body.voters : [])
@@ -209,10 +240,13 @@ const server = createServer(async (req, res) => {
       if (voterAddresses.length !== (Array.isArray(body.voters) ? body.voters.length : 0)) {
         throw new Error('invalid voter addresses (must be otl_esm_... ootle addresses)');
       }
-      if (voterAddresses.length > 5000) {
-        throw new Error('too many voters (max 5000)');
+      if (voterAddresses.length > MAX_VOTERS) {
+        throw new Error(`too many voters (this network allows up to ${MAX_VOTERS} per election)`);
       }
-      const parsed = { title, tallyMethod, numWinners, numCandidates, candidates, voterAddresses, epoch, expiresInEpochs, expiresAtEpoch };
+      if (new Set(voterAddresses).size !== voterAddresses.length) throw new Error('duplicate voter addresses');
+      if (numWinners >= numCandidates && numWinners > 1) throw new Error('multi-winner elections need more candidates than seats');
+      const endUtc = body.endUtc && !Number.isNaN(Date.parse(body.endUtc)) ? new Date(body.endUtc).toISOString() : null;
+      const parsed = { title, tallyMethod, numWinners, numCandidates, candidates, voterAddresses, epoch, expiresInEpochs, expiresAtEpoch, endUtc };
 
       // This server's own account signs and submits -- unchanged, still the simplest path for
       // anyone happy to let the server hold a key.
@@ -241,7 +275,7 @@ const server = createServer(async (req, res) => {
           })),
           expiresAtEpoch,
           expiresInEpochs,
-          expiresAtUtc: epochToUtc(expiresAtEpoch, epoch),
+          expiresAtUtc: endUtc ?? epochToUtc(expiresAtEpoch, epoch),
           resultSchema: 'v2',
           status: 'open',
           txId: initiated.txId,
@@ -282,6 +316,7 @@ const server = createServer(async (req, res) => {
         expiresInEpochs: Math.floor(Number(draft.expiresInEpochs) || 0),
         expiresAtEpoch: Math.floor(Number(draft.expiresAtEpoch) || 0),
         epoch: Math.floor(Number(draft.epoch) || 0),
+        endUtc: draft.endUtc && !Number.isNaN(Date.parse(draft.endUtc)) ? new Date(draft.endUtc).toISOString() : null,
       };
       if (!validated.tallyMethod) throw new Error('invalid draft tally method');
       if (validated.numCandidates < 2) throw new Error('invalid draft: at least 2 candidates required');
@@ -291,7 +326,7 @@ const server = createServer(async (req, res) => {
       if (validated.tallyMethod === 'fptp' && validated.numWinners !== 1) {
         throw new Error('invalid draft: FPTP is single-winner');
       }
-      if (validated.voterAddresses.length < 1 || validated.voterAddresses.length > 5000) {
+      if (validated.voterAddresses.length < 1 || validated.voterAddresses.length > MAX_VOTERS) {
         throw new Error('invalid draft: voter count out of range');
       }
       if (validated.voterAddresses.length !== draftVoters.length) {
@@ -330,9 +365,10 @@ const server = createServer(async (req, res) => {
         })),
         expiresAtEpoch: validated.expiresAtEpoch,
         expiresInEpochs: validated.expiresInEpochs,
-        expiresAtUtc: epochToUtc(validated.expiresAtEpoch, validated.epoch),
+        expiresAtUtc: validated.endUtc ?? epochToUtc(validated.expiresAtEpoch, validated.epoch),
         resultSchema: 'v2',
         status: 'open',
+        initiator: 'wallet',
         txId: finalized.txId,
         events: finalized.events,
       };
@@ -343,21 +379,27 @@ const server = createServer(async (req, res) => {
 
     // list elections
     if (req.method === 'GET' && p === '/api/elections') {
-      return sendJson(res, 200, elections.map(publicElection));
+      return sendJson(res, 200, visible().map(publicElection));
     }
 
     // single election + live state
     const oneMatch = p.match(/^\/api\/elections\/([^/]+)$/);
     if (oneMatch && req.method === 'GET') {
-      const e = elections.find((x) => x.id === oneMatch[1]);
+      const e = visible().find((x) => x.id === oneMatch[1]);
       if (!e) return sendJson(res, 404, { error: 'not found' });
       const epoch = await currentEpoch(ctx);
-      const fresh = { ...publicElection(e), expiresAtUtc: epochToUtc(e.expiresAtEpoch, epoch) };
-      let state = null;
-      try {
-        state = await readElectionState(ctx, e.componentAddress);
-      } catch (err) {
-        state = { error: String(err.message || err) };
+      // Keep the deadline anchored to the recorded wall-clock time; re-deriving it from the epoch on
+      // every request makes it drift with epoch-length jitter.
+      const fresh = { ...publicElection(e), expiresAtUtc: e.expiresAtUtc ?? epochToUtc(e.expiresAtEpoch, epoch) };
+      const state = await cachedState(e);
+      // Ended on-chain by someone else (e.g. `end_vote_expired` from another client): record it.
+      if (state && state.active === false && e.status !== 'ended') {
+        e.status = 'ended';
+        e.endResult = state.result;
+        e.endedAt = new Date().toISOString();
+        saveElections(elections);
+        fresh.status = 'ended';
+        fresh.endResult = state.result;
       }
       return sendJson(res, 200, { ...fresh, epoch, state });
     }
@@ -365,10 +407,12 @@ const server = createServer(async (req, res) => {
     // end vote
     const endMatch = p.match(/^\/api\/elections\/([^/]+)\/(end|end-expired)$/);
     if (endMatch && req.method === 'POST') {
-      const e = elections.find((x) => x.id === endMatch[1]);
+      const e = visible().find((x) => x.id === endMatch[1]);
       if (!e) return sendJson(res, 404, { error: 'not found' });
       const method = endMatch[2] === 'end-expired' ? 'end_vote_expired' : 'end_vote';
+      if (e.status === 'ended') throw new Error('this election has already ended');
       const outcome = await endVote(ctx, e.componentAddress, method);
+      stateCache.delete(e.id);
       e.status = 'ended';
       e.endResult = outcome.result;
       e.endEvents = outcome.events;

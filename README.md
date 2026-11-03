@@ -1,4 +1,20 @@
-# Confidential Ranked-Choice Voting — Web Front End
+# Privote: confidential ranked-choice voting on Tari Ootle
+
+> **Ootle 0.49 (Esmeralda, November 2026).** Uses the `confidential_voting` template from
+> `m4r1m0/confidential-vote-template` (development + PR #27) published at
+> `template_9ddabc4619b218d1cb4d835e91f46a9f2f339312144ecf38f60e6963b4b10fec`.
+> On this version:
+> - one election mints at most **16** ballots (a range proof aggregates at most 16 outputs);
+> - method results are no longer returned by execution, so live state is read from the component
+>   substate and the tally is recomputed with the template's own `rcv-tally` crate compiled to
+>   WASM (`lib/tally`, source in `tools/tally-wasm`). Browsers can recount with the same file;
+> - `TallyMethod` is encoded SequentialIrv=0, Stv=1, Fptp=2, Irv=3, and FPTP ballots are a
+>   single choice `[candidate]`.
+>
+> `scripts/check-mint-cbor.mjs` prints freshly built mint statements as JSON and CBOR so the
+> encoder can be compared byte-for-byte with the Rust codec.
+
+## Original notes
 
 A minimal web front end for the [confidential ranked-choice voting template](https://github.com/m4r1m0/confidential-rcv-template)
 on Tari Ootle (Esmeralda testnet). Election setup, stealth-ballot minting, live

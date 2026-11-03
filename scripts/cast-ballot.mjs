@@ -18,6 +18,7 @@
 //     --ranking 0,2,1
 //
 // Optional: --indexer <url> (default: esmeralda public indexer), --fee <max fee in µTARI>
+// The fee account (derived from --owner-key) must already exist and hold tTARI.
 //
 // NOTE on fees: for full anonymity the fee must also be paid from a stealth
 // TARI UTXO (see the template README). This example pays the fee from the
@@ -28,23 +29,25 @@ import {
   Network,
   OotleWallet,
   StealthInput,
-  componentAddressLiteral,
   StealthInputsStatement,
   StealthOutputsStatement,
   StealthTransferStatement,
   TransactionBuilder,
   WalletStealthAuthorizer,
-  XTR_FAUCET_COMPONENT_ADDRESS,
+  WasmStealthCrypto,
+  decodeEvent,
+  decodeExecuteResult,
   defaultIndexerUrl,
   fromHexStr,
   getVaultIdsForAccount,
   intLiteral,
   resolveMaxEpoch,
+  resolveTransaction,
   submitTransaction,
   watchTransaction,
 } from '@tari-project/ootle';
-import { IndexerProvider } from '../lib/provider.mjs';
-import { SecretKeySigner } from '../lib/signer.mjs';
+import { IndexerProvider } from '@tari-project/ootle-indexer';
+import { SecretKeyWallet } from '@tari-project/ootle-secret-key-wallet';
 import { accountAddressFromPublicKey } from '../lib/derive.mjs';
 
 function arg(name, fallback = null) {
@@ -86,70 +89,15 @@ if (!RANKING.length) {
   process.exit(2);
 }
 
-const provider = new IndexerProvider(INDEXER, NETWORK);
-const signer = new SecretKeySigner(
-  Buffer.from(OWNER_KEY, 'hex'),
-  Buffer.from(VIEW_KEY, 'hex'),
-  NETWORK,
-);
-const wallet = new OotleWallet()
-  .registerKeyProvider(signer.address, signer)
-  .setDefaultSigner(signer.address);
-const account = accountAddressFromPublicKey(signer.ownerPublicKey);
+const provider = await IndexerProvider.connect({ url: INDEXER, network: NETWORK });
+const signer = SecretKeyWallet.fromSecretKey(new Uint8Array(Buffer.from(OWNER_KEY, 'hex')), NETWORK, new Uint8Array(Buffer.from(VIEW_KEY, 'hex')));
+const ownerPublicKey = await signer.getPublicKey();
+const account = accountAddressFromPublicKey(ownerPublicKey);
+const wallet = new OotleWallet().registerKeyProvider(account, signer).setDefaultSigner(account);
 
 const log = (m) => console.log(`[voter] ${m}`);
 
-async function faucetIfNeeded() {
-  log(`account ${account}`);
-  const accountExists = await accountSubstateExists();
-  if (accountExists && (await accountHasTari())) {
-    log('already funded — skipping faucet');
-    return;
-  }
-  const maxEpoch = await resolveMaxEpoch(provider);
-  const b = new TransactionBuilder(NETWORK, maxEpoch);
-  b.withFeeInstructionsBuilder((fb) => {
-    if (accountExists) {
-      fb.callMethod(
-        {
-          methodName: 'take',
-          componentAddress: XTR_FAUCET_COMPONENT_ADDRESS,
-        },
-        [componentAddressLiteral(account)],
-      );
-      fb.callMethod({ methodName: 'pay_fee', componentAddress: account }, [intLiteral(1_000_000n)]);
-    } else {
-      fb.createAccount(Buffer.from(signer.ownerPublicKey).toString('hex'));
-      fb.saveVar('acct');
-      fb.callMethod(
-        {
-          methodName: 'take',
-          componentAddress: XTR_FAUCET_COMPONENT_ADDRESS,
-        },
-        [{ Workspace: 'acct' }],
-      );
-      fb.callMethod({ methodName: 'pay_fee', fromWorkspace: 'acct' }, [intLiteral(1_000_000n)]);
-    }
-    return fb;
-  });
-  b.addInput({ substate_id: XTR_FAUCET_COMPONENT_ADDRESS, version: null });
-  b.addInput({ substate_id: 'vault_0102030000000000000000000000000000000000000000000000000000000001', version: null });
-  b.addInput({ substate_id: 'resource_0102030000000000000000000000000000000000000000000000000000000002', version: null });
-  if (accountExists) {
-    b.addInput({ substate_id: account, version: null });
-    for (const v of await getVaultIdsForAccount(provider, account)) b.addInput({ substate_id: v, version: null });
-  }
-  const unsigned = b.buildUnsignedTransaction();
-  const { signTransaction, sealTransaction, sendTransaction } = await import('@tari-project/ootle');
-  const signed = await signTransaction([signer], unsigned);
-  const envelope = sealTransaction(signed);
-  const txId = await submitTransaction(provider, envelope);
-  log(`faucet tx ${txId} …`);
-  await watchTransaction(provider, txId, { timeoutMs: 120_000 });
-  log('funded');
-}
-
-async function accountSubstateExists() {
+async function accountExists() {
   try {
     await provider.getSubstate(account);
     return true;
@@ -158,27 +106,12 @@ async function accountSubstateExists() {
   }
 }
 
-async function accountHasTari() {
-  try {
-    const vaults = await getVaultIdsForAccount(provider, account);
-    for (const v of vaults) {
-      const res = await provider.getSubstate(v);
-      const container = res?.substate?.Vault?.resource_container;
-      const stealth = container?.Stealth ?? container?.Fungible;
-      if (!stealth) continue;
-      const address = stealth.address ?? stealth.resource_address;
-      if (address === 'resource_0101010101010101010101010101010101010101010101010101010101010101') {
-        return BigInt(stealth.revealed_amount ?? 0) > 0n;
-      }
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
-
 async function cast() {
-  await faucetIfNeeded();
+  log(`fee account ${account}`);
+  if (!(await accountExists())) {
+    console.error('[voter] the fee account does not exist yet — send it some tTARI first');
+    process.exit(1);
+  }
 
   log(`spending ballot ${COMMITMENT.slice(0, 16)}… ranking=${RANKING.join(' > ')}`);
 
@@ -191,9 +124,11 @@ async function cast() {
     inputs: [{ commitment: COMMITMENT, witness: 'KeyPath' }],
     revealed_amount: '0',
   });
+  // Ootle 0.49: a revealed output names the receiver key whose signature authorises taking the
+  // revealed bucket; this transaction is signed with the account key.
   const outputsJson = JSON.stringify({
     outputs: [],
-    revealed_output_amount: '1',
+    revealed_output: { amount: '1', receiver: Buffer.from(ownerPublicKey).toString('hex') },
     agg_range_proof: '',
   });
   const inputsStatement = new StealthInputsStatement([], 0n, inputsJson);
@@ -201,7 +136,7 @@ async function cast() {
   const statement = new StealthTransferStatement(inputsStatement, outputsStatement);
 
   const maxEpoch = await resolveMaxEpoch(provider);
-  const b = new TransactionBuilder(NETWORK, maxEpoch);
+  const b = TransactionBuilder.new(NETWORK, maxEpoch);
   b.addInstruction({
     StealthTransfer: {
       resource_address_ref: { Address: RESOURCE },
@@ -233,23 +168,23 @@ async function cast() {
   }
 
   const spec = {
-    unsignedTx: b.buildUnsignedTransaction(),
+    unsignedTx: await resolveTransaction(provider, b.buildUnsignedTransaction()),
     statement,
     outputMask: Mask.zero(),
     state: {
       resource: RESOURCE,
       revealedInput: null,
-      inputsToSpend: new Map([[COMMITMENT, { input: new StealthInput(commitment), owner: ADDRESS }]]),
+      inputsToSpend: new Map([[COMMITMENT, { input: new StealthInput(commitment), owner: account }]]),
       outputs: [],
-      revealedOutputAmount: 1n,
+      revealedOutput: { amount: 1n, receiver: ownerPublicKey },
     },
-    requiredSigners: [ADDRESS],
-    inputs: [{ input: new StealthInput(commitment), owner: ADDRESS }],
+    requiredSigners: [account],
+    inputs: [{ input: new StealthInput(commitment), owner: account }],
   };
 
   const authorizer = WalletStealthAuthorizer.fromSpec(wallet, spec, {
-    viewSecret: signer.viewKey,
-    mustSignWithAccountKey: true,
+    viewSecret: await signer.getViewSecret(),
+    crypto: new WasmStealthCrypto(NETWORK),
   });
   const authorized = await authorizer.prepare(provider);
   const envelope = await authorized.seal();
@@ -259,20 +194,21 @@ async function cast() {
   const res = await watchTransaction(provider, txId, { timeoutMs: 180_000 });
   const fin = res?.result?.Finalized;
   if (!fin || fin.final_decision !== 'Commit') {
-    console.error('ballot NOT accepted:', JSON.stringify(res?.result));
+    console.error('ballot NOT accepted:', JSON.stringify(res?.result, (k, v) => (typeof v === 'bigint' ? v.toString() : v)).slice(0, 2000));
     process.exit(1);
   }
   log('ballot accepted ✓');
-  for (const e of fin.execution_result?.finalize?.events ?? []) {
+  const exec = typeof fin.execution_result === 'string' ? decodeExecuteResult(fin.execution_result) : fin.execution_result;
+  for (const raw of exec?.finalize?.events ?? []) {
+    const e = typeof raw === 'string' ? decodeEvent(raw) : raw;
     log(`event: ${e.topic} ${JSON.stringify(e.payload)}`);
   }
 }
 
-// CBOR encoding of Vec<u32>: array(n) + each uint
+// CBOR encoding of Vec<u32>. FPTP elections take a single choice: --ranking 2
 function rankingCborHex(ranking) {
-  const parts = [String.fromCharCode(0x80 | ranking.length)];
-  for (const r of ranking) parts.push(String.fromCharCode(r));
-  return Buffer.from(parts.join(''), 'latin1').toString('hex');
+  const head = (major, n) => (n < 24 ? [(major << 5) | n] : n < 256 ? [(major << 5) | 24, n] : [(major << 5) | 25, n >> 8, n & 255]);
+  return Buffer.from([...head(4, ranking.length), ...ranking.flatMap((r) => head(0, r))]).toString('hex');
 }
 
 cast().catch((e) => {

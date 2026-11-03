@@ -2,100 +2,121 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Cast Your Ballot — Confidential Ranked-Choice Voting</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Cast your ballot · Privote</title>
+  <meta name="description" content="Cast a private ballot from your own Tari wallet. Nobody can link your vote to your wallet." />
+  <meta name="theme-color" content="#07080f" />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" />
   <link rel="stylesheet" href="/style.css" />
-  <!-- Provides window.tari when this page is opened inside Tari Universe's own dApp browser (an
-       iframe, not an ordinary tab) -- a no-op when an extension like Sapient already owns
-       window.tari. See https://universe.tari.mw/integration. -->
+  <!-- Provides window.tari inside Tari Universe's dApp browser; a no-op when Sapient already does. -->
   <script src="https://universe.tari.mw/tari-connector.js"></script>
 </head>
 <body>
-  <header>
-    <div class="brand">
-      <h1>Cast Your Ballot</h1>
-      <p class="sub">Tari Ootle · stealth ballot · nobody can link this vote to your wallet</p>
+  <header class="topbar">
+    <div class="shell">
+      <a class="brand" href="/">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a28bff"/><stop offset=".5" stop-color="#6f7dff"/><stop offset="1" stop-color="#45d0e6"/></linearGradient></defs><rect width="32" height="32" rx="9" fill="url(#bg)"/><path d="M9 16.5l4.2 4.2L23 11" fill="none" stroke="#0a0820" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Privote <small>testnet</small>
+      </a>
+      <nav class="nav" aria-label="Main">
+        <a href="/#/">Elections</a>
+        <a href="/#/new">Create</a>
+        <a href="/vote" class="active">Vote</a>
+      </nav>
+      <div class="topbar-right">
+        <span class="net-chip" id="net-chip"><span class="dot"></span> connecting…</span>
+        <button class="icon-btn" id="btn-theme" aria-label="Toggle theme"></button>
+      </div>
     </div>
   </header>
 
-  <main>
-    <p class="hint" style="margin: 0 0 16px;">
-      This casts your ballot from your <strong>own</strong> wallet — this site never sees your keys.
-      Connect a <a href="https://sapient.tari.mw" target="_blank" rel="noopener">Sapient</a> or
-      <a href="https://universe.tari.mw" target="_blank" rel="noopener">Tari Universe</a> wallet below.
-    </p>
-
-    <section class="elections-bar">
-      <span class="hint">Here to run an election, not vote?</span>
-      <a href="/" class="ghost">Go to the initiator console →</a>
+  <main class="narrow">
+    <!-- picker (no ?election= in the link) -->
+    <section id="picker" hidden>
+      <div class="page-head"><div><span class="eyebrow">Cast a ballot</span><h1 class="mt-8">Which election?</h1><p>Pick the election you were invited to. Your wallet checks whether it holds a ballot for it.</p></div></div>
+      <div class="pick-list" id="picker-list"></div>
     </section>
 
-    <!-- Election picker: only shown if no ?election= id was in the link you were given -->
-    <section class="elections-bar" id="election-picker" hidden>
-      <label for="election-select">Election</label>
-      <select id="election-select"><option value="">— choose —</option></select>
-    </section>
+    <div id="not-found" class="empty-state" hidden><div class="ico" data-icon="search"></div><h3>Election not found</h3><p>Check the link you were sent. It may be from before the network reset.</p><a class="btn mt-16" href="/vote">See open elections</a></div>
 
-    <div id="v-not-found" class="error" hidden>Election not found. Check the link you were given.</div>
-
-    <details class="step" id="step-vote" open>
-      <summary><span class="step-num">🗳</span> <span id="v-title">Ballot</span></summary>
-      <div class="step-body">
-        <div class="row">
-          <button id="btn-vote-connect" class="ghost">Connect wallet</button>
-          <span class="hint" id="v-account"></span>
+    <section id="ballot" hidden>
+      <div class="page-head">
+        <div>
+          <div class="flex" id="v-badges"></div>
+          <h1 class="mt-12" id="v-title">Ballot</h1>
+          <p id="v-sub"></p>
         </div>
+      </div>
 
-        <div class="row" id="v-scan-row" hidden>
-          <button id="btn-vote-scan" class="ghost">Scan for my ballot</button>
-          <span class="hint" id="v-scan-status"></span>
-        </div>
-        <div id="v-not-eligible" class="error" hidden>
-          No ballot for this election's ballot resource was found in your wallet.
-        </div>
+      <div id="v-closed" class="callout warn" hidden><span data-icon="clock"></span><div><b>Voting has closed.</b> <a id="v-results-link" href="/">See the results →</a></div></div>
 
-        <div id="v-ballot-fields" hidden>
-          <div class="field">
-            <label>Rank the candidates</label>
-            <p class="hint">Use the arrows to reorder. Top is your 1st choice.</p>
-            <ol id="v-rank-list" class="rank-list"></ol>
+      <div class="vflow" id="vflow">
+        <!-- 1 connect -->
+        <div class="vstep active" data-vstep="connect">
+          <div class="vstep-head"><span class="n"><span>1</span></span><div><h3>Connect your wallet</h3><p id="s1-sub">Sapient or Tari Universe. Privote never sees your keys.</p></div></div>
+          <div class="vstep-body">
+            <button class="btn btn-primary" id="btn-connect" data-icon="wallet">Connect wallet</button>
+            <div class="callout mt-16" id="no-wallet" hidden><span data-icon="info"></span><div><b>No Tari wallet detected.</b> Install <a href="https://sapient.tari.mw" target="_blank" rel="noopener">Sapient</a>, or open this link inside <a href="https://universe.tari.mw" target="_blank" rel="noopener">Tari Universe</a>.</div></div>
           </div>
-
-          <div class="field">
-            <label for="v-fee-commitment">Fee — always paid privately</label>
-            <p class="hint">
-              The transaction fee is paid from a separate stealth XTR UTXO, never from your ordinary
-              balance — paying it any other way would link this transaction (including your ranking)
-              to your wallet address on-chain, defeating the point of a stealth ballot. Checked
-              automatically against your wallet's existing private balance; shield some XTR below if
-              you don't have any yet.
-            </p>
-            <input id="v-fee-commitment" type="text" placeholder="hex… — checked automatically" spellcheck="false" />
-            <div class="row">
-              <button id="btn-vote-shield-fee" class="ghost">Shield XTR for fees</button>
-              <span class="hint" id="v-fee-status"></span>
+        </div>
+        <!-- 2 find ballot -->
+        <div class="vstep locked" data-vstep="find">
+          <div class="vstep-head"><span class="n"><span>2</span></span><div><h3>Find your ballot</h3><p id="s2-sub">Your wallet scans the chain for a ballot only it can unlock.</p></div></div>
+          <div class="vstep-body">
+            <div class="status-line" id="find-status"></div>
+            <div class="btn-row mt-12" id="find-actions" hidden><button class="btn btn-sm" id="btn-rescan" data-icon="refresh">Scan again</button></div>
+          </div>
+        </div>
+        <!-- 3 rank -->
+        <div class="vstep locked" data-vstep="rank">
+          <div class="vstep-head"><span class="n"><span>3</span></span><div><h3 id="s3-title">Rank the candidates</h3><p id="s3-sub">Drag, use the arrows, or tap in order of preference.</p></div></div>
+          <div class="vstep-body">
+            <div id="rank-ui">
+              <div class="rank-help"><span id="rank-hint">Top is your first choice. Every candidate gets a rank.</span>
+                <span class="btn-row"><button class="btn btn-sm btn-ghost" id="btn-tap-mode" data-icon="sparkles">Tap to rank</button><button class="btn btn-sm btn-ghost" id="btn-rank-reset" data-icon="refresh">Reset</button></span></div>
+              <ol class="rank-list" id="rank-list"></ol>
             </div>
+            <div class="pick-list" id="pick-ui" hidden></div>
+            <button class="btn btn-primary mt-16" id="btn-rank-done">Continue</button>
           </div>
-
-          <button id="btn-vote-cast" class="primary" disabled>Cast ballot</button>
         </div>
-
-        <div id="v-progress" class="progress" hidden></div>
-        <div id="v-error" class="error" hidden></div>
-        <div id="v-result" hidden>
-          <h3>Ballot cast ✓</h3>
-          <div class="kv">
-            <div><span>Transaction</span><code id="v-txid"></code></div>
+        <!-- 4 cast -->
+        <div class="vstep locked" data-vstep="cast">
+          <div class="vstep-head"><span class="n"><span>4</span></span><div><h3>Cast privately</h3><p>Review and send. The fee is paid from shielded TARI, so nothing links back to you.</p></div></div>
+          <div class="vstep-body">
+            <div class="card flat" style="padding:16px"><div class="small muted">Your ballot</div><ol id="review" class="mt-8" style="margin:8px 0 0;padding-left:20px;display:grid;gap:4px;font-weight:600"></ol></div>
+            <div class="status-line mt-16" id="fee-status"></div>
+            <div class="btn-row mt-12" id="fee-actions" hidden><button class="btn btn-sm" id="btn-shield" data-icon="shield">Shield 0.5 tTARI for fees</button></div>
+            <details class="disclosure mt-16"><summary>Use a specific fee UTXO</summary><div class="d-body"><p class="small muted">Normally picked automatically. Paste the commitment of a shielded TARI output if you want to choose it yourself.</p><input class="input mt-8 mono" id="fee-commitment" placeholder="64 hex characters" spellcheck="false" /></div></details>
+            <div class="btn-row mt-16"><button class="btn btn-primary btn-lg" id="btn-cast" data-icon="vote" disabled>Cast ballot</button><button class="btn btn-ghost" id="btn-edit">Change ranking</button></div>
+            <div class="status-line mt-12" id="cast-status"></div>
           </div>
         </div>
       </div>
-    </details>
+
+      <div class="card success" id="done" hidden>
+        <div class="big-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></div>
+        <h2>Your vote is in</h2>
+        <p>Your ballot was spent with a one-time key and the fee came from shielded funds, so it cannot be traced to your wallet.</p>
+        <div class="btn-row"><a class="btn btn-primary" id="done-results" data-icon="chart">Watch the results</a><a class="btn" id="done-tx" target="_blank" rel="noopener" data-icon="ext">View transaction</a></div>
+      </div>
+
+      <div class="card mt-24">
+        <div class="privacy-note">
+          <div class="ico" data-icon="eyeoff"></div><div><h4>Who you are stays private</h4><p>Ballots are stealth tokens. Spending one reveals nothing about the wallet that received it.</p></div>
+          <div class="ico" data-icon="chart"></div><div><h4>What you chose is public</h4><p>Rankings are recorded on-chain so anyone can recount, but none of them carries your identity.</p></div>
+          <div class="ico" data-icon="lock"></div><div><h4>Privote never holds your keys</h4><p>Everything is signed in your own wallet. This page only builds the request.</p></div>
+        </div>
+      </div>
+    </section>
   </main>
 
-  <footer>
-    <p>Everything runs on-chain on the Esmeralda testnet. Voter identity is hidden by stealth ballots; ballot contents and the tally are public.</p>
-  </footer>
+  <footer class="site"><div class="shell"><span>Privote · Tari Ootle Esmeralda testnet</span><span><a href="/">Elections</a> · <a href="https://explorer.tari.mw" target="_blank" rel="noopener">Explorer</a></span></div></footer>
 
+  <script src="/ui.js"></script>
   <script src="/wallet.js"></script>
   <script src="/vote.js"></script>
 </body>

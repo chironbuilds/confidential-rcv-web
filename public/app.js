@@ -1,769 +1,661 @@
-// Confidential RCV front end — vanilla JS, no frameworks.
-// Talks only to the same-origin backend API.
+// Privote console: election list, create wizard and live election page. Hash-routed, no framework.
+(function () {
+  const { $, $$, esc, icon, toast, log, api, avatar, short, relTime, fmtDate, splitDuration, METHODS, phaseOf, badge, explorer, copyBtn } = window.UI;
+  UI.mountChrome();
 
-const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const state = {
-  currentElection: null,
-  status: null,
-  pollTimer: null,
-  candidates: [],
-  voters: [],
-};
+  const MAX_VOTERS_DEFAULT = 16;
+  const maxVoters = () => UI.status()?.maxVoters ?? MAX_VOTERS_DEFAULT;
 
-// ---------- terminal log ----------
-const logEl = $('log');
-const badgeEl = $('log-badge');
-let logCount = 0;
-
-function log(msg, cls = '') {
-  const t = new Date().toISOString().slice(11, 23);
-  const line = document.createElement('div');
-  line.innerHTML = `<span class="t">[${t}]</span> ${msg}`;
-  if (cls) line.classList.add(cls);
-  logEl.appendChild(line);
-  logEl.scrollTop = logEl.scrollHeight;
-  logCount += 1;
-  badgeEl.textContent = logCount;
-}
-
-$('btn-log-clear').addEventListener('click', () => {
-  logEl.innerHTML = '';
-  logCount = 0;
-  badgeEl.textContent = '0';
-});
-$('btn-log-copy').addEventListener('click', () => {
-  navigator.clipboard?.writeText(logEl.innerText);
-});
-
-async function api(path, opts = {}) {
-  log(`<span class="ok">→</span> ${opts.method || 'GET'} ${path}`);
-  const res = await fetch(path, {
-    method: opts.method || 'GET',
-    headers: opts.body ? { 'Content-Type': 'application/json' } : undefined,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    log(`<span class="err">✗ ${res.status}</span> ${JSON.stringify(data)}`, 'err');
-    throw new Error(data.error || `HTTP ${res.status}`);
-  }
-  log(`<span class="ok">✓</span> ${JSON.stringify(data).slice(0, 200)}`);
-  return data;
-}
-
-// ---------- status ----------
-async function refreshStatus() {
-  try {
-    const s = await api('/api/status');
-    state.status = s;
-    $('pill-network').textContent = `network: ${s.network}`;
-    $('pill-network').classList.add('ok');
-    $('pill-epoch').textContent = `epoch: ${s.epoch}`;
-    $('pill-epoch').classList.add('ok');
-    $('pill-template').textContent = s.templateAddress
-      ? `template: ${s.templateAddress.slice(0, 12)}…`
-      : 'template: NOT SET';
-    $('pill-template').classList.toggle('ok', !!s.templateAddress);
-    $('pill-template').title = s.templateAddress || '';
-    updateDeadlinePreview();
-  } catch (e) {
-    log(`status failed: ${e.message}`, 'err');
-  }
-}
-
-// ---------- voting deadline (UTC) ----------
-function utcNowIso() {
-  return new Date().toISOString();
-}
-
-function toUtcIso(datetimeLocalValue) {
-  if (!datetimeLocalValue) return null;
-  const t = new Date(datetimeLocalValue + ':00Z');
-  return Number.isNaN(t.getTime()) ? null : t.toISOString();
-}
-
-function setDefaultDeadline() {
-  const d = new Date(Date.now() + 7 * 24 * 3600 * 1000);
-  const pad = (n) => String(n).padStart(2, '0');
-  $('in-end-utc').value = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
-  updateDeadlinePreview();
-}
-
-function updateDeadlinePreview() {
-  const el = $('end-preview');
-  const s = state.status;
-  const iso = toUtcIso($('in-end-utc').value);
-  if (!iso || !s) {
-    el.textContent = 'choose a date and time (UTC)';
-    return;
-  }
-  const target = Date.parse(iso);
-  const durationSecs = s.epochDurationSecs || 1200;
-  const diffEpochs = Math.max(0, Math.ceil((target - Date.now()) / 1000 / durationSecs));
-  const diffDays = ((target - Date.now()) / (24 * 3600 * 1000)).toFixed(1);
-  if (target <= Date.now()) {
-    el.textContent = 'that time is in the past — pick a future deadline';
-    return;
-  }
-  const epoch = s.epoch + diffEpochs;
-  const dateStr = new Date(target).toUTCString().replace('GMT', 'UTC');
-  el.textContent = `closes at epoch ${epoch} — ${dateStr} (~${diffDays} days from now)`;
-}
-
-$('in-end-utc').addEventListener('input', updateDeadlinePreview);
-
-// ---------- step 1: candidates ----------
-function renderCandidates() {
-  const ul = $('candidate-list');
-  ul.innerHTML = '';
-  state.candidates.forEach((name, i) => {
-    const li = document.createElement('li');
-    li.innerHTML = `<span class="idx">${i}</span><span class="name"></span>`;
-    li.querySelector('.name').textContent = name;
-    const del = document.createElement('button');
-    del.className = 'del';
-    del.textContent = '✕';
-    del.title = 'remove';
-    del.addEventListener('click', () => {
-      state.candidates.splice(i, 1);
-      renderCandidates();
-    });
-    li.appendChild(del);
-    ul.appendChild(li);
-  });
-}
-
-$('btn-add-candidate').addEventListener('click', () => {
-  const name = $('in-candidate').value.trim();
-  if (!name) return;
-  state.candidates.push(name);
-  $('in-candidate').value = '';
-  renderCandidates();
-});
-$('in-candidate').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') {
-    e.preventDefault();
-    $('btn-add-candidate').click();
-  }
-});
-
-function updateMethodHint() {
-  const m = $('in-method').value;
-  if (m === 'fptp') {
-    $('in-winners').value = 1;
-    $('in-winners').disabled = true;
-    $('hint-winners').textContent =
-      'FPTP is single-winner — exactly one winner; only each ballot’s first preference counts, no majority required.';
-  } else {
-    $('in-winners').disabled = false;
-    $('hint-winners').textContent = m === 'irv'
-      ? 'With one winner the tally is single-winner IRV regardless of method.'
-      : 'Sequential IRV fills seats by repeating IRV; STV uses proportional transfer with the Droop quota.';
-  }
-}
-
-$('in-method').addEventListener('change', updateMethodHint);
-
-// ---------- step 2: voters ----------
-function parseVoterText(text) {
-  return text
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean);
-}
-
-function renderVoterCount() {
-  const n = state.voters.length;
-  $('voter-count').textContent = `${n} voter${n === 1 ? '' : 's'}`;
-}
-
-$('in-voters').addEventListener('input', () => {
-  state.voters = parseVoterText($('in-voters').value);
-  renderVoterCount();
-});
-
-// CSV import
-const csvDialog = $('csv-dialog');
-
-function parseCsv(text) {
-  const rows = [];
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    const cols = [];
-    let cur = '';
-    let inQ = false;
-    for (let i = 0; i < line.length; i++) {
-      const c = line[i];
-      if (inQ) {
-        if (c === '"') {
-          if (line[i + 1] === '"') { cur += '"'; i++; }
-          else inQ = false;
-        } else cur += c;
-      } else if (c === '"') inQ = true;
-      else if (c === ',') { cols.push(cur); cur = ''; }
-      else cur += c;
-    }
-    cols.push(cur);
-    rows.push(cols.map((c) => c.trim()));
-  }
-  return rows;
-}
-
-$('btn-csv').addEventListener('click', () => {
-  $('csv-text').value = '';
-  $('csv-status').textContent = '';
-  csvDialog.showModal();
-});
-
-$('csv-file').addEventListener('change', async (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
-  $('csv-text').value = await file.text();
-});
-
-$('csv-apply').addEventListener('click', () => {
-  const rows = parseCsv($('csv-text').value);
-  const start = rows[0] && !/^otl_esm_/.test(rows[0][0]) ? 1 : 0;
-  const addresses = rows.slice(start).map((r) => r[0]).filter(Boolean);
-  const seen = new Set(state.voters);
-  const added = addresses.filter((a) => !seen.has(a));
-  state.voters = state.voters.concat(added);
-  $('in-voters').value = state.voters.join('\n');
-  renderVoterCount();
-  $('csv-status').textContent = `added ${added.length} voter(s) from ${rows.length - start} row(s)`;
-  log(`CSV: added ${added.length} voters`);
-});
-
-// ---------- step 3: initiate ----------
-function renderSummary() {
-  const t = $('init-summary');
-  t.innerHTML = '';
-  const rows = [
-    ['Title', state.status?.network || '…'],
-    ['Voting method', $('in-method').selectedOptions[0].textContent],
-    ['Winners', $('in-winners').value],
-    ['Candidates', state.candidates.length ? state.candidates.map((c, i) => esc(`#${i} ${c}`)).join('<br>') : '—'],
-    ['Voters', `${state.voters.length} address(es)`],
-    ['Voting deadline (UTC)', deadlineSummary()],
-  ];
-  rows[0][1] = $('in-title').value || '(untitled)';
-  for (const [k, v] of rows) {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${esc(k)}</td><td>${v}</td>`;
-    t.appendChild(tr);
-  }
-}
-
-function deadlineSummary() {
-  const iso = toUtcIso($('in-end-utc').value);
-  if (!iso) return '—';
-  const s = state.status;
-  const target = Date.parse(iso);
-  const durationSecs = s?.epochDurationSecs || 1200;
-  const diffEpochs = Math.max(1, Math.ceil((target - Date.now()) / 1000 / durationSecs));
-  const dateStr = new Date(target).toUTCString().replace('GMT', 'UTC');
-  return `${dateStr} → epoch ${(s?.epoch ?? 0) + diffEpochs}`;
-}
-
-function validateSetup() {
-  if (state.candidates.length < 2) throw new Error('add at least 2 candidates');
-  const winners = Number($('in-winners').value);
-  if (winners < 1 || winners > state.candidates.length) {
-    throw new Error('winners must be between 1 and the number of candidates');
-  }
-  if ($('in-method').value === 'fptp' && winners !== 1) {
-    throw new Error('FPTP is single-winner (numWinners must be 1)');
-  }
-  if (state.voters.length < 1) throw new Error('add at least one voter address');
-  for (const v of state.voters) {
-    if (!/^otl_esm_/.test(v)) throw new Error(`invalid voter address: ${v.slice(0, 20)}…`);
-  }
-  const endUtc = toUtcIso($('in-end-utc').value);
-  if (!endUtc) throw new Error('choose a voting deadline (UTC)');
-  if (Date.parse(endUtc) <= Date.now()) throw new Error('voting deadline must be in the future');
-  return { winners, endUtc };
-}
-
-// ---------- optional: sign election creation with the initiator's own wallet ----------
-let initiatorAccount = null;
-
-document.querySelectorAll('input[name="init-signer"]').forEach((el) =>
-  el.addEventListener('change', () => {
-    const useWallet = $('init-signer-wallet').checked;
-    $('init-wallet-row').hidden = !useWallet;
-    $('init-signer-hint').textContent = useWallet
-      ? "Your wallet pays the fee and is recorded as this election's initiator (only the initiator can end the vote early) — this server never sees your keys."
-      : "The server's own account pays the fee and is recorded as this election's initiator — simplest, no wallet needed.";
-  }),
-);
-
-$('btn-init-connect').addEventListener('click', async () => {
-  if (!window.tari) {
-    log('No Tari wallet found — install Sapient or open this page from inside Tari Universe.', 'err');
-    return;
-  }
-  try {
-    const [account] = await window.tari.request({ method: 'tari_requestAccounts' });
-    initiatorAccount = account;
-    $('init-wallet-account').textContent = `connected: ${account.slice(0, 14)}…${account.slice(-8)}`;
-  } catch (e) {
-    log(`wallet connect failed: ${e?.message || e}`, 'err');
-  }
-});
-
-// The create -> poll -> submit helper lives in wallet.js (shared with the voting page).
-
-// A `kind: "instructions"` result is the *raw* indexer response (just `{ result: {...} }`, no
-// top-level id at all) -- unlike the custom stealth-redemption kinds, which return a convenient
-// `{ transactionId }` directly. Dig the hash out of the one place it actually lives.
-function extractTransactionId(result) {
-  return result?.transactionId ?? result?.result?.Finalized?.execution_result?.finalize?.transaction_hash ?? null;
-}
-
-function showElectionResult(e) {
-  state.currentElection = e;
-  $('init-result').hidden = false;
-  $('res-component').textContent = e.componentAddress;
-  $('res-resource').textContent = e.ballotResource;
-  $('res-txid').textContent = e.txId || '—';
-  $('res-vote-link').value = `${location.origin}/vote?election=${e.id}`;
-  renderBallotTable(e);
-  loadElectionOptions();
-}
-
-$('btn-initiate').addEventListener('click', async () => {
-  let opts;
-  try {
-    opts = validateSetup();
-  } catch (e) {
-    log(`validate: ${e.message}`, 'err');
-    alert(e.message);
-    return;
-  }
-  const useWallet = $('init-signer-wallet').checked;
-  if (useWallet && !initiatorAccount) {
-    alert('Connect your wallet first.');
-    return;
-  }
-
-  $('btn-initiate').disabled = true;
-  $('init-progress').hidden = false;
-  const body = {
-    title: $('in-title').value.trim(),
-    tallyMethod: $('in-method').value,
-    numWinners: opts.winners,
-    numCandidates: state.candidates.length,
-    candidates: state.candidates,
-    voters: state.voters,
-    endUtc: opts.endUtc,
-  };
-  try {
-    if (useWallet) {
-      $('init-progress').textContent = 'preparing the transaction…';
-      const prep = await api('/api/elections/prepare', { method: 'POST', body });
-      $('init-progress').textContent = 'waiting for wallet approval…';
-      const result = await window.RcvWallet.submitTransactionRequest({ kind: 'instructions', instructions: prep.instructions, maxFee: prep.maxFee });
-      const transactionId = extractTransactionId(result);
-      if (!transactionId) throw new Error(`Wallet accepted the transaction but returned no transaction id: ${JSON.stringify(result).slice(0, 300)}`);
-      $('init-progress').textContent = 'confirming on-chain…';
-      const e = await api('/api/elections/finalize', {
-        method: 'POST',
-        body: { transactionId, draft: prep.draft, ballots: prep.ballots },
-      });
-      log(`election created via wallet: <code>${e.componentAddress}</code>`);
-      showElectionResult(e);
+  // =====================================================================
+  // Router
+  // =====================================================================
+  let leaveView = null;
+  function route() {
+    const h = location.hash.replace(/^#/, '') || '/';
+    if (leaveView) { leaveView(); leaveView = null; }
+    // Old links: /?election=<id>
+    const legacy = new URLSearchParams(location.search).get('election');
+    if (legacy && h === '/') { location.replace(`/#/e/${legacy}`); return; }
+    $$('.view').forEach((v) => (v.hidden = true));
+    $$('[data-nav]').forEach((a) => a.classList.remove('active'));
+    let m;
+    if (h === '/new') {
+      show('view-new', 'new');
+      Wizard.enter();
+    } else if ((m = h.match(/^\/e\/([^/]+)/))) {
+      show('view-election');
+      leaveView = Election.enter(decodeURIComponent(m[1]));
     } else {
-      $('init-progress').textContent = 'submitting — minting stealth ballots, creating component…';
-      const e = await api('/api/elections', { method: 'POST', body });
-      log(`election created: <code>${e.componentAddress}</code>`);
-      showElectionResult(e);
+      show('view-home', 'home');
+      Home.enter();
     }
-    openStep('step-monitor');
-    await loadElection(state.currentElection.id);
-  } catch (err) {
-    // Was hiding the element and *then* writing the failure text into it -- the progress line
-    // just silently disappeared on any failure (e.g. mid "confirming on-chain…"), with nothing
-    // visible to say what happened unless you happened to have the log panel open.
-    $('init-progress').hidden = false;
-    $('init-progress').textContent = `failed: ${err.message}`;
-    log(`initiate failed: ${err.message}`, 'err');
-  } finally {
-    $('btn-initiate').disabled = false;
+    window.scrollTo({ top: 0 });
   }
-});
-
-// No voter address column -- the server never stores or serves one (see server.mjs). A voter
-// finds their own ballot by connecting their wallet on the voting page and scanning the chain,
-// not by looking up their address in a table this server keeps.
-function renderBallotTable(e) {
-  const t = $('ballot-table');
-  t.innerHTML = '<tr><th>#</th><th>Ballot commitment</th><th>Sender nonce</th></tr>';
-  e.voters.forEach((v, i) => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${i}</td>
-      <td><code>${v.commitment}</code> <button class="copy" data-copy="${v.commitment}" title="copy">⧉</button></td>
-      <td><code>${v.nonce}</code> <button class="copy" data-copy="${v.nonce}" title="copy">⧉</button></td>`;
-    t.appendChild(tr);
-  });
-  t.querySelectorAll('.copy').forEach((b) =>
-    b.addEventListener('click', () => navigator.clipboard?.writeText(b.dataset.copy)),
-  );
-}
-
-$('btn-copy-vote-link').addEventListener('click', async () => {
-  const ok = await navigator.clipboard?.writeText($('res-vote-link').value).then(() => true, () => false);
-  $('btn-copy-vote-link').textContent = ok ? 'Copied ✓' : 'Copy failed';
-  setTimeout(() => ($('btn-copy-vote-link').textContent = 'Copy link'), 1500);
-});
-
-$('btn-ballots-csv').addEventListener('click', () => {
-  const e = state.currentElection;
-  if (!e) return;
-  const lines = ['index,ballot_commitment,sender_nonce'];
-  e.voters.forEach((v, i) => {
-    lines.push(`${i},${v.commitment},${v.nonce}`);
-  });
-  const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'ballots.csv';
-  a.click();
-  URL.revokeObjectURL(a.href);
-});
-
-// ---------- step 4: monitor ----------
-async function loadElectionOptions() {
-  const list = await api('/api/elections');
-  const sel = $('election-select');
-  const current = sel.value;
-  sel.innerHTML = '<option value="">— none —</option>';
-  for (const e of list) {
-    const opt = document.createElement('option');
-    opt.value = e.id;
-    opt.textContent = `${e.title} (${e.voters.length} voters)`;
-    sel.appendChild(opt);
+  function show(id, nav) {
+    const v = document.getElementById(id);
+    v.hidden = false;
+    v.classList.remove('view');
+    void v.offsetWidth;
+    v.classList.add('view');
+    if (nav) document.querySelector(`[data-nav="${nav}"]`)?.classList.add('active');
   }
-  if (current && list.some((e) => e.id === current)) sel.value = current;
-}
+  window.addEventListener('hashchange', route);
 
-$('btn-refresh-list').addEventListener('click', loadElectionOptions);
-
-$('election-select').addEventListener('change', async () => {
-  const id = $('election-select').value;
-  if (!id) {
-    state.currentElection = null;
-    $('monitor').hidden = true;
-    $('monitor-empty').hidden = false;
-    return;
-  }
-  await loadElection(id);
-});
-
-async function loadElection(id) {
-  try {
-    const e = await api(`/api/elections/${id}`);
-    state.currentElection = e;
-    $('monitor').hidden = false;
-    $('monitor-empty').hidden = true;
-    renderMonitor(e);
-    if ($('in-autopoll').checked) startPolling(e.id);
-  } catch (err) {
-    log(`load election failed: ${err.message}`, 'err');
-  }
-}
-
-function renderMonitor(e) {
-  const st = e.state || {};
-  const status = e.status === 'ended' ? 'ended' : st.error ? 'error' : 'open';
-  $('m-status').textContent = status;
-  $('m-status').style.color = status === 'ended' ? 'var(--accent)' : status === 'error' ? 'var(--err)' : 'var(--fg)';
-  $('m-epoch').textContent = e.epoch;
-  $('m-deadline').textContent = e.expiresAtUtc
-    ? new Date(e.expiresAtUtc).toUTCString().replace('GMT', 'UTC')
-    : String(e.expiresAtEpoch);
-  $('m-cast').textContent = st.ballotCount ?? '—';
-  $('m-voters').textContent = st.voterCount ?? '—';
-  $('m-vault').textContent = st.vaultBalance ?? '—';
-  $('m-error').hidden = !st.error;
-  if (st.error) $('m-error').textContent = 'state error: ' + st.error;
-
-  const expired = e.epoch > e.expiresAtEpoch;
-  $('btn-end').hidden = e.status === 'ended' || !expired;
-  $('btn-end-expired').hidden = e.status === 'ended' || !expired;
-  $('btn-end').disabled = e.status === 'ended';
-
-  if (st.result) renderResult(st.result, e.resultSchema);
-  else if (e.endResult) renderResult(e.endResult, e.resultSchema);
-}
-
-// The indexer decodes template return values into minicbor-shaped JS values:
-// enums as [variant, payload], indexed structs as arrays, optionals as the bare
-// value (or absent), and indexed maps as {"@cbor":"map","entries":[[k,v],...]}.
-// Normalize all of that into a plain shape for rendering.
-function normCounts(counts) {
-  if (!counts) return {};
-  const out = {};
-  if (counts['@cbor'] === 'map' && Array.isArray(counts.entries)) {
-    for (const [k, v] of counts.entries) out[String(k)] = Number(v ?? 0);
-  } else if (typeof counts === 'object') {
-    for (const [k, v] of Object.entries(counts)) out[k] = Number(v ?? 0);
-  }
-  return out;
-}
-
-function normOpt(v) {
-  if (Array.isArray(v)) return v.length ? v[0] : null;
-  return v ?? null;
-}
-
-function normRound(round) {
-  if (!Array.isArray(round)) return null;
-  return { counts: normCounts(round[0]), eliminated: round[1] == null ? null : Number(round[1]) };
-}
-
-function normalizeResult(result, schema = 'v2') {
-  if (!result) return null;
-  if (typeof result === 'object' && !Array.isArray(result)) {
-    // { Irv: {...} }-style shape (not currently produced by the indexer, kept for robustness)
-    const kind = Object.keys(result)[0];
-    return { kind, raw: result[kind], winner: result[kind]?.winner ?? null,
-             rounds: result[kind]?.rounds ?? [], winners: result[kind]?.winners ?? [],
-             seats: result[kind]?.seats ?? [] };
-  }
-  if (!Array.isArray(result)) return null;
-  const variant = result[0];
-  let payload = result[1];
-  if (Array.isArray(payload) && payload.length === 1 && Array.isArray(payload[0])) {
-    payload = payload[0];
-  }
-  // Variant indices depend on the template the component was created with:
-  //   legacy (pre-FPTP): Irv=0, SequentialIrv=1, Stv=2
-  //   v2 (FPTP):         Irv=0, Fptp=1, SequentialIrv=2, Stv=3
-  if (variant === 0) {
-    return {
-      kind: 'Irv',
-      winner: normOpt(payload?.[0]),
-      rounds: (payload?.[1] ?? []).map(normRound).filter(Boolean),
-    };
-  }
-  if (schema === 'legacy') {
-    if (variant === 1) {
-      return {
-        kind: 'SequentialIrv',
-        winners: (payload?.[0] ?? []).map(Number),
-        seats: (payload?.[1] ?? []).map((seat) => ({
-          winner: normOpt(seat?.[0]),
-          irv_rounds: (seat?.[1] ?? []).map(normRound).filter(Boolean),
-        })),
-      };
+  // =====================================================================
+  // Home
+  // =====================================================================
+  const Home = (() => {
+    let all = [];
+    let filter = 'all';
+    async function enter() {
+      const grid = $('#election-grid');
+      if (!all.length) grid.innerHTML = Array.from({ length: 3 }, () => '<div class="skeleton" style="height:178px;border-radius:20px"></div>').join('');
+      try {
+        all = await api('/api/elections');
+        await UI.loadStatus();
+        draw();
+      } catch (e) {
+        grid.innerHTML = `<div class="callout err" style="grid-column:1/-1">${icon('alert')}<div>${esc(e.message)}</div></div>`;
+      }
     }
-    if (variant === 2) {
-      return {
-        kind: 'Stv',
-        winners: (payload?.[0] ?? []).map(Number),
-        rounds: (payload?.[1] ?? []).map((round) => ({
-          counts: normCounts(round?.[0]),
-          elected: (round?.[1] ?? []).map(Number),
-          eliminated: round?.[2] == null ? null : Number(round[2]),
-          quota: round?.[3] == null ? null : Number(round[3]),
-        })),
-      };
+    function draw() {
+      const grid = $('#election-grid');
+      const epoch = UI.status()?.epoch;
+      const list = all
+        .map((e) => ({ e, ph: phaseOf(e, epoch) }))
+        .filter(({ ph }) => filter === 'all' || (filter === 'ended' ? ph.key === 'ended' || ph.key === 'expired' : ph.key === 'open' || ph.key === 'closing'))
+        .sort((a, b) => Date.parse(b.e.createdAt) - Date.parse(a.e.createdAt));
+      if (!list.length) {
+        grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><div class="ico">${icon('ballot')}</div>
+          <h3>${all.length ? 'Nothing here' : 'No elections yet'}</h3><p>${all.length ? 'No elections match this filter.' : 'Be the first to run a private election on the new network.'}</p>
+          <a class="btn btn-primary" href="#/new">${icon('plus')} Create an election</a></div>`;
+        return;
+      }
+      grid.innerHTML = list.map(({ e, ph }) => card(e, ph)).join('');
     }
-    return null;
-  }
-  if (variant === 1) {
-    return {
-      kind: 'Fptp',
-      winner: normOpt(payload?.[0]),
-      counts: normCounts(payload?.[1]),
-    };
-  }
-  if (variant === 2) {
-    return {
-      kind: 'SequentialIrv',
-      winners: (payload?.[0] ?? []).map(Number),
-      seats: (payload?.[1] ?? []).map((seat) => ({
-        winner: normOpt(seat?.[0]),
-        irv_rounds: (seat?.[1] ?? []).map(normRound).filter(Boolean),
-      })),
-    };
-  }
-  if (variant === 3) {
-    return {
-      kind: 'Stv',
-      winners: (payload?.[0] ?? []).map(Number),
-      rounds: (payload?.[1] ?? []).map((round) => ({
-        counts: normCounts(round?.[0]),
-        elected: (round?.[1] ?? []).map(Number),
-        eliminated: round?.[2] == null ? null : Number(round[2]),
-        quota: round?.[3] == null ? null : Number(round[3]),
-      })),
-    };
-  }
-  return null;
-}
-
-function candidateName(id) {
-  const c = state.currentElection?.candidates;
-  return c && Number(id) < c.length ? c[Number(id)] : `Candidate ${id}`;
-}
-
-// Candidate names are user-supplied (election creator's own input) but still end up in
-// innerHTML-driven tables; escape every place they are interpolated.
-const candidateNameEsc = (id) => esc(candidateName(id));
-
-function renderResult(result, schema = 'v2') {
-  const el = $('m-results');
-  $('m-raw-pre').textContent = JSON.stringify(result, null, 2);
-
-  const r = normalizeResult(result, schema);
-  let html = '';
-  if (!r) {
-    html = '<p class="hint">Unrecognised result shape — see raw JSON below.</p>';
-  } else if (r.kind === 'Fptp') {
-    html = `<h4>Winner</h4><p class="winner">${r.winner != null ? candidateNameEsc(r.winner) : 'no winner'}</p>`;
-    html += '<h4>First-preference counts</h4>' + fptpCountsTable(r.counts, r.winner);
-  } else if (r.kind === 'Irv') {
-    html = `<h4>Winner</h4><p class="winner">${r.winner != null ? candidateNameEsc(r.winner) : 'no winner'}</p>`;
-    html += '<h4>Rounds</h4>' + roundsTable(r.rounds, r.winner != null);
-  } else if (r.kind === 'SequentialIrv') {
-    html = `<h4>Winners</h4><p class="winner">${r.winners.length ? r.winners.map(candidateNameEsc).join(', ') : 'none'}</p>`;
-    r.seats.forEach((seat, i) => {
-      html += `<h4>Seat ${i + 1}${seat.winner != null ? ' — winner ' + candidateNameEsc(seat.winner) : ''}</h4>`;
-      html += roundsTable(seat.irv_rounds, seat.winner != null);
-    });
-  } else if (r.kind === 'Stv') {
-    html = `<h4>Winners (elected in order)</h4><p class="winner">${r.winners.length ? r.winners.map(candidateNameEsc).join(', ') : 'none'}</p>`;
-    html += stvRoundsTable(r.rounds);
-  }
-  el.innerHTML = html;
-}
-
-function fptpCountsTable(counts, winner) {
-  const order = Object.keys(counts).map(Number).sort((a, b) => a - b);
-  let html = '<table class="round-table"><tr><th>Candidate</th><th>First-preference votes</th><th></th></tr>';
-  for (const c of order) {
-    const isWinner = winner != null && c === winner;
-    html += `<tr><td>${candidateNameEsc(c)}</td><td>${counts[c] ?? 0}</td><td class="${isWinner ? 'winner' : ''}">${isWinner ? 'winner' : ''}</td></tr>`;
-  }
-  return html + '</table>';
-}
-
-function roundsTable(rounds, hasWinner = true) {
-  if (!rounds.length) return '<p class="hint">no rounds</p>';
-  const cands = new Set();
-  for (const r of rounds) Object.keys(normCounts(r.counts)).forEach((c) => cands.add(Number(c)));
-  const order = [...cands].sort((a, b) => a - b);
-  let html = '<table class="round-table"><tr><th>Round</th>';
-  for (const c of order) html += `<th>${candidateNameEsc(c)}</th>`;
-  html += '<th>Action</th></tr>';
-  rounds.forEach((r, i) => {
-    const counts = normCounts(r.counts);
-    html += `<tr><td>${i + 1}</td>`;
-    for (const c of order) {
-      html += `<td>${counts[c] ?? '·'}</td>`;
+    function card(e, ph) {
+      const m = METHODS[e.tallyMethod] ?? METHODS.irv;
+      const cands = e.candidates ?? [];
+      const shown = cands.slice(0, 5).map((c, i) => avatar(c, i)).join('');
+      const more = cands.length > 5 ? `<span class="avatar more">+${cands.length - 5}</span>` : '';
+      const when = ph.endsAt ? (ph.key === 'ended' || ph.key === 'expired' ? `Closed ${relTime(ph.endsAt)}` : `Closes ${relTime(ph.endsAt)}`) : `Epoch ${e.expiresAtEpoch}`;
+      return `<a class="ecard" href="#/e/${encodeURIComponent(e.id)}">
+        <div class="e-top">${badge(ph)}<span class="e-method">${esc(m.short)}${e.numWinners > 1 ? ` · ${e.numWinners} seats` : ''}</span></div>
+        <h3>${esc(e.title)}</h3>
+        <div class="avatars">${shown}${more}</div>
+        <div class="e-meta"><span>${icon('users')}${e.voters?.length ?? 0} voters</span><span>${icon('clock')}${esc(when)}</span></div>
+      </a>`;
     }
-    const final = r.eliminated == null;
-    const action = final
-      ? hasWinner ? 'winner' : 'no winner'
-      : `eliminated ${candidateNameEsc(r.eliminated)}`;
-    const cls = final ? (hasWinner ? 'winner' : '') : 'elim';
-    html += `<td class="${cls}">${action}</td></tr>`;
-  });
-  return html + '</table>';
-}
+    $('#btn-refresh-list').onclick = enter;
+    $$('#filter-pills .pill-btn').forEach((b) => (b.onclick = () => {
+      filter = b.dataset.filter;
+      $$('#filter-pills .pill-btn').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      draw();
+    }));
+    return { enter };
+  })();
 
-function stvRoundsTable(rounds) {
-  if (!rounds.length) return '<p class="hint">no rounds</p>';
-  const cands = new Set();
-  for (const r of rounds) Object.keys(normCounts(r.counts)).forEach((c) => cands.add(Number(c)));
-  const order = [...cands].sort((a, b) => a - b);
-  let html = '<table class="round-table"><tr><th>Round</th>';
-  for (const c of order) html += `<th>${candidateNameEsc(c)}</th>`;
-  html += '<th>Action</th></tr>';
-  rounds.forEach((r, i) => {
-    const counts = normCounts(r.counts);
-    html += `<tr><td>${i + 1}</td>`;
-    for (const c of order) html += `<td>${counts[c] ?? '·'}</td>`;
-    const acts = [];
-    if (r.elected?.length) acts.push(`elected ${r.elected.map(candidateNameEsc).join(', ')}`);
-    if (r.eliminated != null) acts.push(`eliminated ${candidateNameEsc(r.eliminated)}`);
-    if (!acts.length) acts.push('—');
-    html += `<td>${acts.join('; ')}</td></tr>`;
-  });
-  return html + '</table>';
-}
+  // =====================================================================
+  // Create wizard
+  // =====================================================================
+  const Wizard = (() => {
+    const DRAFT_KEY = 'privote-draft';
+    const s = { step: 0, title: '', method: 'irv', winners: 2, candidates: [], votersText: '', deadline: { preset: '3d', custom: '' }, signer: 'server', walletAccount: null, busy: false };
+    const PRESETS = [['1h', '1 hour', 3600e3], ['1d', '1 day', 86400e3], ['3d', '3 days', 3 * 86400e3], ['1w', '1 week', 7 * 86400e3], ['custom', 'Pick a date', 0]];
+    const ADDR = /^otl_esm_1[02-9ac-hj-np-z]{20,}$/;
 
-function irvHtml(val) {
-  const winner = val.winner != null ? `Candidate ${val.winner}` : 'no winner';
-  return `<h4>Winner</h4><p class="winner">${winner}</p><h4>Rounds</h4>${roundsTable(val.rounds || [])}`;
-}
-
-function startPolling(id) {
-  clearInterval(state.pollTimer);
-  state.pollTimer = setInterval(async () => {
-    if (!state.currentElection || state.currentElection.id !== id) return;
+    // restore draft
     try {
-      const e = await api(`/api/elections/${id}`);
-      state.currentElection = e;
-      renderMonitor(e);
-      if (e.status === 'ended') clearInterval(state.pollTimer);
-    } catch {
-      /* keep polling */
+      const d = JSON.parse(UI.store.get(DRAFT_KEY) || 'null');
+      if (d) Object.assign(s, { title: d.title ?? '', method: d.method ?? 'irv', winners: d.winners ?? 2, candidates: d.candidates ?? [], votersText: d.votersText ?? '', deadline: d.deadline ?? s.deadline });
+    } catch { /* ignore */ }
+    const save = () => UI.store.set(DRAFT_KEY, JSON.stringify({ title: s.title, method: s.method, winners: s.winners, candidates: s.candidates, votersText: s.votersText, deadline: s.deadline }));
+
+    // ---- methods ----
+    const methodHost = $('#method-choices');
+    methodHost.innerHTML = Object.entries(METHODS).map(([k, m]) => `<button type="button" class="choice" role="radio" data-method="${k}" aria-checked="false"><span class="check"></span>
+      <span class="choice-title"><span class="choice-icon">${icon(m.icon)}</span>${esc(m.name)}</span><span class="choice-desc">${esc(m.desc)}</span>
+      <span class="tag">${m.multi ? 'Multi-winner' : 'Single winner'}${m.ranked ? ' · ranked' : ''}</span></button>`).join('');
+    methodHost.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-method]');
+      if (!b) return;
+      s.method = b.dataset.method;
+      if (METHODS[s.method].multi && s.winners < 2) s.winners = 2;
+      sync();
+    });
+    $('#win-dec').onclick = () => { s.winners = Math.max(2, s.winners - 1); sync(); };
+    $('#win-inc').onclick = () => { s.winners = Math.min(Math.max(2, s.candidates.length - 1), s.winners + 1); sync(); };
+
+    // ---- deadline ----
+    $('#deadline-pills').innerHTML = PRESETS.map(([k, l]) => `<button type="button" class="pill-btn" data-preset="${k}" aria-pressed="false">${l}</button>`).join('');
+    $('#deadline-pills').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-preset]');
+      if (!b) return;
+      s.deadline.preset = b.dataset.preset;
+      if (s.deadline.preset === 'custom' && !s.deadline.custom) {
+        const d = new Date(Date.now() + 2 * 86400e3);
+        d.setMinutes(0, 0, 0);
+        s.deadline.custom = toLocalInput(d);
+      }
+      sync();
+    });
+    $('#in-end').addEventListener('input', (e) => { s.deadline.custom = e.target.value; sync(); });
+    function toLocalInput(d) {
+      const p = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
     }
-  }, 5000);
-}
+    function deadlineMs() {
+      if (s.deadline.preset === 'custom') {
+        const t = Date.parse(s.deadline.custom);
+        return Number.isNaN(t) ? null : t;
+      }
+      const p = PRESETS.find(([k]) => k === s.deadline.preset);
+      return p ? Date.now() + p[2] : null;
+    }
 
-$('btn-refresh').addEventListener('click', () => {
-  if (state.currentElection) loadElection(state.currentElection.id);
-});
+    // ---- title ----
+    $('#in-title').addEventListener('input', (e) => { s.title = e.target.value; sync(); });
 
-$('in-autopoll').addEventListener('change', () => {
-  if ($('in-autopoll').checked && state.currentElection) startPolling(state.currentElection.id);
-  else clearInterval(state.pollTimer);
-});
+    // ---- candidates ----
+    function addCandidates(text) {
+      const names = text.split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean);
+      let added = 0;
+      for (const n of names) {
+        if (s.candidates.length >= 50) break;
+        if (s.candidates.some((c) => c.toLowerCase() === n.toLowerCase())) continue;
+        s.candidates.push(n.slice(0, 80));
+        added++;
+      }
+      if (names.length && !added) toast('Already on the list', '', 'info', 2000);
+      sync();
+    }
+    $('#btn-add-candidate').onclick = () => { addCandidates($('#in-candidate').value); $('#in-candidate').value = ''; $('#in-candidate').focus(); };
+    $('#in-candidate').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#btn-add-candidate').click(); } });
+    $('#in-candidate').addEventListener('paste', (e) => {
+      const t = e.clipboardData?.getData('text') ?? '';
+      if (/[\n,;]/.test(t)) { e.preventDefault(); addCandidates(t); }
+    });
+    $('#cand-presets').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-preset]');
+      if (!b) return;
+      s.candidates = b.dataset.preset === 'yesno' ? ['Yes', 'No'] : ['Yes', 'No', 'Abstain'];
+      if (b.dataset.preset === 'yesno') s.method = 'fptp';
+      sync();
+    });
+    $('#candidate-list').addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-act]');
+      if (!b) return;
+      const i = Number(b.closest('li').dataset.i);
+      if (b.dataset.act === 'del') s.candidates.splice(i, 1);
+      if (b.dataset.act === 'up' && i > 0) [s.candidates[i - 1], s.candidates[i]] = [s.candidates[i], s.candidates[i - 1]];
+      if (b.dataset.act === 'down' && i < s.candidates.length - 1) [s.candidates[i + 1], s.candidates[i]] = [s.candidates[i], s.candidates[i + 1]];
+      sync();
+    });
 
-$('btn-end').addEventListener('click', () => endVoteAction('end'));
-$('btn-end-expired').addEventListener('click', () => endVoteAction('end-expired'));
+    // ---- voters ----
+    function parseVoters() {
+      const lines = s.votersText.split(/\r?\n/).map((l) => l.split(',')[0].trim().replace(/^"|"$/g, '')).filter(Boolean);
+      const valid = [];
+      const invalid = [];
+      const seen = new Set();
+      let dupes = 0;
+      lines.forEach((l, i) => {
+        if (i === 0 && !l.startsWith('otl_') && /addr|wallet|voter/i.test(l)) return; // CSV header
+        if (!ADDR.test(l)) { invalid.push(l); return; }
+        if (seen.has(l)) { dupes++; return; }
+        seen.add(l);
+        valid.push(l);
+      });
+      return { valid, invalid, dupes };
+    }
+    $('#in-voters').addEventListener('input', (e) => { s.votersText = e.target.value; sync(); });
+    const drop = $('#voter-drop');
+    ['dragenter', 'dragover'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('drag'); }));
+    ['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, () => drop.classList.remove('drag')));
+    drop.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      const f = e.dataTransfer?.files?.[0];
+      if (f) importText(await f.text(), f.name);
+    });
+    $('#btn-csv').onclick = () => $('#csv-file').click();
+    $('#csv-file').onchange = async (e) => {
+      const f = e.target.files[0];
+      if (f) importText(await f.text(), f.name);
+      e.target.value = '';
+    };
+    function importText(text, name) {
+      const before = parseVoters().valid.length;
+      s.votersText = (s.votersText.trim() ? s.votersText.trim() + '\n' : '') + text.trim();
+      $('#in-voters').value = s.votersText;
+      sync();
+      toast(`Imported ${name}`, `${parseVoters().valid.length - before} new voter address(es)`, 'ok');
+    }
 
-async function endVoteAction(kind) {
-  const e = state.currentElection;
-  if (!e) return;
-  if (!confirm(kind === 'end' ? 'End the vote now and compute the final tally?' : 'Finalize the expired election with the ballots cast so far?')) return;
-  $('m-progress').hidden = false;
-  $('m-progress').textContent = 'ending vote…';
-  try {
-    const r = await api(`/api/elections/${e.id}/${kind}`, { method: 'POST', body: {} });
-    log(`vote ended: <code>${e.componentAddress}</code>`);
-    await loadElection(e.id);
-  } catch (err) {
-    log(`end failed: ${err.message}`, 'err');
-  } finally {
-    $('m-progress').hidden = true;
-  }
-}
+    // ---- signer ----
+    $('#signer-choices').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-signer]');
+      if (!b) return;
+      s.signer = b.dataset.signer;
+      sync();
+    });
+    $('#btn-init-connect').onclick = async () => {
+      if (!window.tari) return toast('No Tari wallet found', 'Install Sapient, or open Privote inside Tari Universe.', 'err');
+      try {
+        const [account] = await window.tari.request({ method: 'tari_requestAccounts' });
+        s.walletAccount = account;
+        toast('Wallet connected', short(account, 14, 8), 'ok');
+        sync();
+      } catch (e) {
+        toast('Wallet connection failed', e?.message || String(e), 'err');
+      }
+    };
 
-// ---------- step highlighting ----------
-function openStep(id) {
-  document.querySelectorAll('.step').forEach((s) => s.classList.remove('current'));
-  const el = $(id);
-  el.open = true;
-  el.classList.add('current');
-}
+    // ---- validation ----
+    function checks() {
+      const v = parseVoters();
+      const m = METHODS[s.method];
+      const end = deadlineMs();
+      return {
+        title: s.title.trim().length > 0,
+        candidates: s.candidates.length >= 2 && (!m.multi || s.winners < s.candidates.length),
+        voters: v.valid.length >= 1 && v.valid.length <= maxVoters() && v.invalid.length === 0,
+        deadline: end != null && end > Date.now() + 60e3,
+        v,
+      };
+    }
+    function stepValid(i) {
+      const c = checks();
+      return [c.title && c.deadline, c.candidates, c.voters, c.title && c.deadline && c.candidates && c.voters][i];
+    }
 
-document.querySelectorAll('.step summary').forEach((s) => {
-  s.addEventListener('click', () => {
-    document.querySelectorAll('.step').forEach((x) => x.classList.remove('current'));
-    s.closest('.step').classList.add('current');
-  });
-});
+    // ---- render ----
+    function sync() {
+      save();
+      const m = METHODS[s.method];
+      const c = checks();
+      $$('#method-choices .choice').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.method === s.method)));
+      $('#winners-field').hidden = !m.multi;
+      if (m.multi) s.winners = Math.max(2, Math.min(s.winners, Math.max(2, s.candidates.length - 1)));
+      $('#in-winners').textContent = String(m.multi ? s.winners : 1);
+      $('#win-dec').disabled = s.winners <= 2;
+      $('#win-inc').disabled = s.winners >= Math.max(2, s.candidates.length - 1);
+      $('#winners-hint').textContent = s.candidates.length > 2 ? `up to ${s.candidates.length - 1}` : 'add candidates first';
+      if ($('#in-title').value !== s.title) $('#in-title').value = s.title;
 
-// ---------- init ----------
-updateMethodHint();
-setDefaultDeadline();
-refreshStatus();
-setInterval(refreshStatus, 30000);
-renderCandidates();
-loadElectionOptions();
+      $$('#deadline-pills .pill-btn').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.preset === s.deadline.preset)));
+      $('#in-end').hidden = s.deadline.preset !== 'custom';
+      if (s.deadline.preset === 'custom' && $('#in-end').value !== s.deadline.custom) $('#in-end').value = s.deadline.custom;
+      const end = deadlineMs();
+      const st = UI.status();
+      $('#end-preview').innerHTML = end
+        ? end <= Date.now() + 60e3
+          ? '<span style="color:var(--err)">Pick a time in the future.</span>'
+          : `Closes <b>${esc(fmtDate(end))}</b> (${esc(relTime(end))}).${st ? ` About epoch ${st.epoch + Math.ceil((end - Date.now()) / 1000 / (st.epochDurationSecs || 1200))}; voting ends at the first epoch boundary after this.` : ''}`
+        : '';
+
+      // candidates
+      $('#cand-count').textContent = String(s.candidates.length);
+      $('#cand-empty').hidden = s.candidates.length > 0;
+      $('#candidate-list').innerHTML = s.candidates.map((n, i) => `<li class="cand-item" data-i="${i}">${avatar(n, i)}<span class="name">${esc(n)}</span><span class="idx">#${i + 1}</span>
+        <button class="icon-btn" data-act="up" aria-label="Move up" ${i === 0 ? 'disabled' : ''}>${icon('up')}</button>
+        <button class="icon-btn" data-act="down" aria-label="Move down" ${i === s.candidates.length - 1 ? 'disabled' : ''}>${icon('down')}</button>
+        <button class="icon-btn" data-act="del" aria-label="Remove ${esc(n)}">${icon('trash')}</button></li>`).join('');
+
+      // voters
+      if ($('#in-voters').value !== s.votersText) $('#in-voters').value = s.votersText;
+      const max = maxVoters();
+      $('#max-voters').textContent = String(max);
+      const n = c.v.valid.length;
+      const meter = $('#voter-meter');
+      meter.querySelector('span').style.width = `${Math.min(100, (n / max) * 100)}%`;
+      meter.classList.toggle('full', n === max);
+      meter.classList.toggle('over', n > max);
+      $('#voter-stats').innerHTML = `<span><b>${n}</b> / ${max} voters</span>${c.v.dupes ? `<span>${c.v.dupes} duplicate${c.v.dupes === 1 ? '' : 's'} skipped</span>` : ''}${c.v.invalid.length ? `<span class="bad">${c.v.invalid.length} invalid</span>` : ''}${n > max ? `<span class="bad">${n - max} over the limit</span>` : ''}`;
+      const issues = $('#voter-issues');
+      issues.hidden = !c.v.invalid.length;
+      issues.innerHTML = c.v.invalid.slice(0, 8).map((l) => `<li>Not an Esmeralda address: <code>${esc(short(l, 22, 6))}</code></li>`).join('') + (c.v.invalid.length > 8 ? `<li>…and ${c.v.invalid.length - 8} more</li>` : '');
+
+      // signer
+      $$('#signer-choices .choice').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.signer === s.signer)));
+      $('#wallet-row').hidden = s.signer !== 'wallet';
+      $('#init-wallet-account').textContent = s.walletAccount ? `Connected ${short(s.walletAccount, 14, 8)}` : 'Not connected';
+      $('#launch-summary').innerHTML = `<div class="p-rows">
+        <div class="p-row"><span>Title</span><span>${esc(s.title || '—')}</span></div>
+        <div class="p-row"><span>Method</span><span>${esc(m.name)}${m.multi ? `, ${s.winners} seats` : ''}</span></div>
+        <div class="p-row"><span>Candidates</span><span>${s.candidates.length}</span></div>
+        <div class="p-row"><span>Voters</span><span>${n} stealth ballot${n === 1 ? '' : 's'}</span></div>
+        <div class="p-row"><span>Closes</span><span>${end ? esc(fmtDate(end)) : '—'}</span></div></div>`;
+
+      // preview
+      $('#pv-title').textContent = s.title.trim() || 'Untitled election';
+      $('#pv-title').classList.toggle('empty', !s.title.trim());
+      $('#pv-method').textContent = m.short;
+      $('#pv-cands').innerHTML = s.candidates.slice(0, 12).map((x, i) => `<span class="chip">${avatar(x, i)}<span>${esc(x)}</span></span>`).join('') + (s.candidates.length > 12 ? `<span class="chip" style="padding-left:9px">+${s.candidates.length - 12}</span>` : '');
+      $('#pv-seats').textContent = String(m.multi ? s.winners : 1);
+      $('#pv-voters').textContent = String(n);
+      $('#pv-closes').textContent = end ? relTime(end) : '—';
+      $('#pv-checks').innerHTML = [
+        [c.title, 'Has a title'],
+        [c.deadline, 'Deadline in the future'],
+        [c.candidates, m.multi ? `At least ${s.winners + 1} candidates` : 'At least 2 candidates'],
+        [c.voters, `1–${max} valid voter addresses`],
+      ].map(([ok, t]) => `<li class="${ok ? 'ok' : ''}">${t}</li>`).join('');
+
+      // steps
+      $$('#wizard-steps .wstep').forEach((b, i) => {
+        b.classList.toggle('active', i === s.step);
+        b.classList.toggle('done', i !== s.step && stepValid(i) && i < 3);
+      });
+      $$('.wizard-panel').forEach((p, i) => p.classList.toggle('active', i === s.step));
+      $('#btn-back').style.visibility = s.step === 0 ? 'hidden' : 'visible';
+      const next = $('#btn-next');
+      if (s.step === 3) {
+        next.innerHTML = s.busy ? '<span class="spinner"></span> Launching…' : `${icon('zap')} Launch election`;
+        next.disabled = s.busy || !stepValid(3) || (s.signer === 'wallet' && !s.walletAccount);
+      } else {
+        next.innerHTML = `Continue ${icon('right')}`;
+        next.disabled = false;
+      }
+    }
+
+    function go(step) {
+      s.step = Math.max(0, Math.min(3, step));
+      sync();
+      $('#view-new').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      if (s.step === 1) setTimeout(() => $('#in-candidate').focus(), 50);
+    }
+    $('#wizard-steps').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-step]');
+      if (b) go(Number(b.dataset.step));
+    });
+    $('#btn-back').onclick = () => go(s.step - 1);
+    $('#btn-next').onclick = () => {
+      if (s.step < 3) {
+        if (!stepValid(s.step)) {
+          const c = checks();
+          const msg = [
+            !c.title ? 'Give the election a title.' : !c.deadline ? 'Choose a deadline in the future.' : '',
+            METHODS[s.method].multi && s.candidates.length <= s.winners ? `Add at least ${s.winners + 1} candidates for ${s.winners} seats.` : 'Add at least two candidates.',
+            c.v.invalid.length ? 'Fix the invalid addresses.' : c.v.valid.length > maxVoters() ? `This network allows up to ${maxVoters()} voters per election.` : 'Add at least one voter address.',
+          ][s.step];
+          toast('Almost there', msg, 'info', 3500);
+          return;
+        }
+        go(s.step + 1);
+      } else launch();
+    };
+
+    function setStatus(html, kind = '') {
+      const el = $('#launch-status');
+      el.className = `status-line mt-16 ${kind}`;
+      el.innerHTML = html;
+    }
+    const extractTxId = (r) => r?.transactionId ?? r?.transaction_id ?? r?.result?.Finalized?.execution_result?.finalize?.transaction_hash ?? null;
+
+    async function launch() {
+      const c = checks();
+      if (!stepValid(3)) return;
+      s.busy = true;
+      sync();
+      const body = {
+        title: s.title.trim(),
+        tallyMethod: s.method,
+        numWinners: METHODS[s.method].multi ? s.winners : 1,
+        numCandidates: s.candidates.length,
+        candidates: s.candidates,
+        voters: c.v.valid,
+        endUtc: new Date(deadlineMs()).toISOString(),
+      };
+      try {
+        let e;
+        if (s.signer === 'wallet') {
+          setStatus('<span class="spinner"></span> Building the ballots…');
+          const prep = await api('/api/elections/prepare', { method: 'POST', body });
+          setStatus('<span class="spinner"></span> Approve the transaction in your wallet…');
+          const result = await window.RcvWallet.submitTransactionRequest({ kind: 'instructions', instructions: prep.instructions, maxFee: prep.maxFee });
+          const transactionId = extractTxId(result);
+          if (!transactionId) throw new Error('The wallet did not return a transaction id.');
+          setStatus('<span class="spinner"></span> Confirming on-chain…');
+          e = await api('/api/elections/finalize', { method: 'POST', body: { transactionId, draft: prep.draft, ballots: prep.ballots } });
+        } else {
+          setStatus(`<span class="spinner"></span> Minting ${c.v.valid.length} stealth ballot${c.v.valid.length === 1 ? '' : 's'} and creating the election…`);
+          e = await api('/api/elections', { method: 'POST', body });
+        }
+        log(`election created: <code>${esc(e.componentAddress)}</code>`);
+        UI.store.del(DRAFT_KEY);
+        Object.assign(s, { step: 0, title: '', candidates: [], votersText: '', busy: false });
+        setStatus('');
+        toast('Your election is live', 'Share the voting link with your voters.', 'ok', 6000);
+        location.hash = `#/e/${encodeURIComponent(e.id)}?new=1`;
+      } catch (err) {
+        s.busy = false;
+        setStatus(`${icon('alert')} ${esc(err.message)}`, 'err');
+        toast('Could not launch', err.message, 'err', 8000);
+        sync();
+      }
+    }
+
+    function enter() {
+      UI.loadStatus().then(sync);
+      sync();
+      setTimeout(() => { if (s.step === 0 && !s.title) $('#in-title').focus(); }, 60);
+    }
+    return { enter };
+  })();
+
+  // =====================================================================
+  // Election page
+  // =====================================================================
+  const Election = (() => {
+    let current = null;
+    let poll = null;
+    let tick = null;
+    let lastResultJson = '';
+
+    function enter(id) {
+      current = null;
+      lastResultJson = '';
+      $('#e-loading').hidden = false;
+      $('#e-body').hidden = true;
+      $('#e-missing').hidden = true;
+      const isNew = location.hash.includes('new=1');
+      load(id, isNew);
+      poll = setInterval(() => load(id), 8000);
+      tick = setInterval(drawCountdown, 1000);
+      return () => { clearInterval(poll); clearInterval(tick); };
+    }
+
+    async function load(id, celebrate = false) {
+      try {
+        const e = await api(`/api/elections/${encodeURIComponent(id)}`, { quiet: !!current });
+        const before = current?.id === e.id ? current?.state?.ballotCount : undefined;
+        const after = e.state?.ballotCount;
+        if (before != null && after != null && after > before) {
+          toast(after - before === 1 ? 'A new ballot arrived' : `${after - before} new ballots arrived`, `${after} of ${e.state.voterCount} cast`, 'ok', 4000);
+        }
+        current = e;
+        draw(e);
+        if (celebrate) {
+          UI.confetti(document.body);
+          history.replaceState(null, '', `#/e/${encodeURIComponent(id)}`);
+        }
+      } catch (err) {
+        if (!current) {
+          $('#e-loading').hidden = true;
+          $('#e-missing').hidden = false;
+        }
+      }
+    }
+
+    function draw(e) {
+      $('#e-loading').hidden = true;
+      $('#e-body').hidden = false;
+      const ph = phaseOf(e);
+      const m = METHODS[e.tallyMethod] ?? METHODS.irv;
+      const st = e.state || {};
+      document.title = `${e.title} · Privote`;
+      $('#e-badges').innerHTML = `${badge(ph)}<span class="badge outline">${esc(m.short)}</span>`;
+      $('#e-title').textContent = e.title;
+      $('#e-sub').innerHTML = `<span>Created ${esc(relTime(Date.parse(e.createdAt)))}</span><span>·</span><span>${(e.candidates ?? []).length} candidates</span>${e.numWinners > 1 ? `<span>·</span><span>${e.numWinners} seats</span>` : ''}`;
+      const cast = st.ballotCount != null ? Number(st.ballotCount) : null;
+      const voters = st.voterCount != null ? Number(st.voterCount) : e.voters?.length ?? 0;
+      const pct = cast != null && voters ? Math.round((cast / voters) * 100) : 0;
+      $('#e-ring').style.setProperty('--p', String(pct));
+      $('#e-turnout').textContent = `${pct}%`;
+      $('#e-cast').textContent = cast ?? '—';
+      $('#e-cast-sub').textContent = `of ${voters} ballots cast`;
+      $('#e-voters').textContent = String(voters);
+      if (ph.key === 'ended' && e.endedAt && (!ph.endsAt || Date.parse(e.endedAt) < ph.endsAt)) {
+        $('#e-deadline').textContent = fmtDate(Date.parse(e.endedAt));
+        $('#e-deadline-sub').textContent = `Ended early, ${relTime(Date.parse(e.endedAt))}`;
+      } else {
+        $('#e-deadline').textContent = ph.endsAt ? fmtDate(ph.endsAt) : `Epoch ${e.expiresAtEpoch}`;
+        $('#e-deadline-sub').textContent = `${ph.endsAt ? relTime(ph.endsAt) + ' · ' : ''}epoch ${e.expiresAtEpoch} (now ${e.epoch})`;
+      }
+      $('#e-method').textContent = m.name;
+      $('#e-method-sub').textContent = m.ranked ? 'Ranked ballots' : 'Single choice';
+      drawCountdown();
+
+      const link = `${location.origin}/vote?election=${encodeURIComponent(e.id)}`;
+      $('#e-link').textContent = link;
+      $('#btn-copy-link').onclick = (ev) => UI.copyText(link, ev.currentTarget);
+      $('#e-vote-btn').href = link;
+      $('#e-vote-btn').hidden = ph.key === 'ended' || ph.key === 'expired';
+
+      // admin
+      const isServerInitiated = !e.initiator || e.initiator === 'server';
+      $('#btn-end').hidden = ph.key !== 'open' && ph.key !== 'closing';
+      $('#btn-end').disabled = !isServerInitiated;
+      $('#btn-end-expired').hidden = ph.key !== 'expired';
+      $('#e-admin').hidden = ph.key === 'ended';
+      $('#e-admin-hint').textContent = ph.key === 'expired'
+        ? 'The deadline has passed. Anyone can finalize the count now.'
+        : isServerInitiated
+          ? 'Ending early freezes the ballots cast so far and publishes the final tally.'
+          : "Launched from the organiser's own wallet, so only that wallet can end it early. Anyone can finalize once the deadline passes.";
+
+      // results
+      const result = st.result ?? e.endResult;
+      const json = JSON.stringify(result ?? null);
+      if (st.error && result == null) {
+        $('#e-results').innerHTML = `<div class="callout warn">${icon('alert')}<div>Couldn’t read the live tally from the network. Retrying automatically…<div class="tiny muted mt-8 mono" style="word-break:break-all">${esc(st.error.slice(0, 220))}</div></div></div>`;
+      } else if (result != null && json !== lastResultJson) {
+        lastResultJson = json;
+        window.Results.render($('#e-results'), result, e);
+        $('#e-raw').textContent = JSON.stringify(result, null, 2);
+      } else if (result == null) {
+        $('#e-results').innerHTML = `<div class="empty-state" style="padding:32px">${icon('chart')}<p class="mt-8">No ballots counted yet.</p></div>`;
+      }
+      $('#e-results-hint').textContent = ph.key === 'ended' ? 'Final result, computed on-chain.' : 'Provisional tally of the ballots cast so far. It updates live.';
+      $('#e-updated').textContent = `Updated ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`;
+
+      // public ballots (anonymous rankings, exactly as stored on-chain)
+      drawPublicBallots(e);
+
+      // ballots
+      $('#e-ballot-count').textContent = String(e.voters?.length ?? 0);
+      $('#e-ballots').innerHTML = '<tr><th>#</th><th>Commitment</th><th>Sender nonce</th></tr>' + (e.voters ?? []).map((v, i) => `<tr><td class="num">${i + 1}</td><td><code>${esc(short(v.commitment, 14, 8))}</code> ${copyBtn(v.commitment)}</td><td><code>${esc(short(v.nonce, 14, 8))}</code> ${copyBtn(v.nonce)}</td></tr>`).join('');
+
+      // chain
+      const rows = [
+        ['Component', e.componentAddress, explorer.substate(e.componentAddress)],
+        ['Ballot token', e.ballotResource, explorer.substate(e.ballotResource)],
+        ['Template', e.templateAddress, explorer.template(e.templateAddress)],
+        ['Created in', e.txId, e.txId ? explorer.tx(e.txId) : null],
+      ].filter((r) => r[1]);
+      $('#e-chain').innerHTML = rows.map(([k, v, href]) => `<div class="kv-row"><span>${k}</span><code title="${esc(v)}">${esc(short(v, 16, 6))}</code><span class="flex" style="gap:2px">${copyBtn(v)}${href ? `<a class="copy-btn" href="${href}" target="_blank" rel="noopener" title="Open in explorer">${icon('ext')}</a>` : ''}</span></div>`).join('');
+    }
+
+    function drawPublicBallots(e) {
+      const ballots = e.state?.ballots;
+      const names = e.candidates ?? [];
+      $('#e-verify').hidden = !Array.isArray(ballots);
+      if (!Array.isArray(ballots)) return;
+      $('#btn-recount').disabled = ballots.length === 0;
+      $('#e-public-ballots').innerHTML = ballots.length
+        ? '<tr><th>#</th><th>Ranking (first choice first)</th></tr>' + ballots.map((b, i) => `<tr><td class="num">${i + 1}</td><td>${b.map((c) => esc(names[c] ?? `#${c + 1}`)).join(' <span class="muted">›</span> ')}</td></tr>`).join('')
+        : '<tr><td class="muted">No ballots yet.</td></tr>';
+    }
+
+    let tallyMod = null;
+    async function recount() {
+      const e = current;
+      if (!e?.state?.ballots) return;
+      const st = $('#recount-status');
+      st.className = 'status-line';
+      st.innerHTML = '<span class="spinner"></span> Loading the tally code…';
+      try {
+        if (!tallyMod) {
+          tallyMod = await import('/tally/rcv_tally_wasm.js');
+          await tallyMod.default('/tally/rcv_tally_wasm_bg.wasm');
+        }
+        const t0 = performance.now();
+        const mine = JSON.parse(tallyMod.tally(e.tallyMethod, JSON.stringify(e.state.ballots), e.numCandidates, e.numWinners));
+        const ms = Math.max(1, Math.round(performance.now() - t0));
+        const theirs = e.state.result;
+        const same = JSON.stringify(mine) === JSON.stringify(theirs);
+        st.className = `status-line ${same ? 'ok' : 'err'}`;
+        st.innerHTML = same
+          ? `${icon('check')} Recounted ${e.state.ballots.length} ballot${e.state.ballots.length === 1 ? '' : 's'} in ${ms} ms. The result matches.`
+          : `${icon('alert')} Your recount differs from the displayed result. Check the raw data below.`;
+      } catch (err) {
+        st.className = 'status-line err';
+        st.innerHTML = `${icon('alert')} ${esc(err.message)}`;
+      }
+    }
+    $('#btn-recount').onclick = recount;
+
+    function drawCountdown() {
+      if (!current) return;
+      const ph = phaseOf(current);
+      const host = $('#e-countdown');
+      if (!ph.endsAt || ph.key === 'ended' || ph.key === 'expired') {
+        host.className = 'countdown done';
+        host.innerHTML = ph.key === 'ended' ? '' : '<div class="unit"><b>00</b><span>closed</span></div>';
+        return;
+      }
+      const d = splitDuration(ph.endsAt - Date.now());
+      const pad = (n) => String(n).padStart(2, '0');
+      host.className = 'countdown';
+      host.innerHTML = [[d.d, 'days'], [d.h, 'hours'], [d.m, 'min'], [d.s, 'sec']].filter(([v, l], i) => i > 0 || v > 0).map(([v, l]) => `<div class="unit"><b>${pad(v)}</b><span>${l}</span></div>`).join('');
+    }
+
+    async function end(kind) {
+      const e = current;
+      if (!e) return;
+      const ok = await UI.confirmDialog(kind === 'end'
+        ? { title: 'End voting now?', body: 'No more ballots can be cast, and the final tally is published on-chain. This cannot be undone.', confirm: 'End voting', danger: true }
+        : { title: 'Finalize the results?', body: 'This locks in the ballots cast before the deadline and publishes the final tally on-chain.', confirm: 'Finalize' });
+      if (!ok) return;
+      const status = $('#e-admin-status');
+      status.className = 'status-line mt-12';
+      status.innerHTML = '<span class="spinner"></span> Submitting to the network…';
+      $$('#e-admin button').forEach((b) => (b.disabled = true));
+      try {
+        await api(`/api/elections/${encodeURIComponent(e.id)}/${kind}`, { method: 'POST', body: {} });
+        status.innerHTML = '';
+        toast('Voting has ended', 'The final result is on-chain.', 'ok');
+        await load(e.id);
+      } catch (err) {
+        status.className = 'status-line mt-12 err';
+        status.innerHTML = `${icon('alert')} ${esc(err.message)}`;
+      } finally {
+        $$('#e-admin button').forEach((b) => (b.disabled = false));
+      }
+    }
+    $('#btn-end').onclick = () => end('end');
+    $('#btn-end-expired').onclick = () => end('end-expired');
+    $('#btn-ballots-csv').onclick = () => {
+      if (!current) return;
+      const lines = ['index,ballot_commitment,sender_nonce', ...(current.voters ?? []).map((v, i) => `${i},${v.commitment},${v.nonce}`)];
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/csv' }));
+      a.download = `${current.title.replace(/[^\w-]+/g, '_').slice(0, 40) || 'election'}-ballots.csv`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    };
+    return { enter };
+  })();
+
+  route();
+})();

@@ -1,410 +1,430 @@
-// Voter-only page: cast a ballot via window.tari. Deliberately asks for as little as possible —
-// the election component/resource and the voter's own ballot commitment are all looked up
-// automatically from the election record and the connected wallet address, never typed in.
-const $ = (id) => document.getElementById(id);
+// Voter flow: connect → find ballot → rank → cast, all through the voter's own window.tari wallet.
+// The ballot is spent with its one-time stealth key and the fee comes from a shielded TARI UTXO,
+// so the transaction cannot be linked to the voter's wallet.
+(function () {
+  const { $, $$, esc, icon, toast, api, avatar, short, relTime, fmtDate, METHODS, phaseOf, badge, explorer } = window.UI;
+  UI.mountChrome();
 
-const XTR_RESOURCE = 'resource_0101010101010101010101010101010101010101010101010101010101010101';
-const FEE_SHIELD_AMOUNT = '500000';
-const FEE_MAX_FEE = '100000';
-const FEE_COMMITMENT_KEY = 'rcv-voter-fee-commitment';
-// Every ballot the template mints is worth exactly 1 unit ("one amount-1 stealth ballot UTXO per
-// voter" — see the mint statement in lib/mint.mjs), so this is a fixed constant, not user input.
-const BALLOT_REVEALED_AMOUNT = '1';
+  const XTR = 'resource_0101010101010101010101010101010101010101010101010101010101010101';
+  const FEE_SHIELD = '500000';
+  const MAX_FEE = '100000';
+  const FEE_KEY = 'rcv-voter-fee-commitment';
+  const BALLOT_AMOUNT = '1';
 
-let election = null;
-let voterAccount = null;
-let ballotCommitment = null;
+  const v = { election: null, wallet: null, ballot: null, order: [], pick: null, fee: null, step: 'connect', tapMode: false, tapped: [] };
+  const STEPS = ['connect', 'find', 'rank', 'cast'];
 
-async function api(path) {
-  const res = await fetch(path);
-  const body = await res.json();
-  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
-  return body;
-}
-
-function voterError(msg) {
-  const el = $('v-error');
-  el.textContent = msg;
-  el.hidden = !msg;
-}
-
-function rankingCborHex(ranking) {
-  const bytes = [0x80 | ranking.length, ...ranking];
-  return bytes.map((b) => b.toString(16).padStart(2, '0')).join('');
-}
-
-// ---------- rank candidate list ----------
-// Renders one <li> per candidate, in the election's own declared order (index = candidate id,
-// what cast_ballot's ranking refers to). The voter reorders the <li> elements via the up/down
-// buttons only -- current top-to-bottom DOM order at cast time *is* the ranking, read straight
-// off data-id. (Drag-to-reorder was tried and dropped: HTML5 native drag-and-drop broke inside
-// Tari Universe's dApp iframe -- dragstart fired but dragend/drop never did, leaving an item stuck
-// mid-drag -- and a Pointer Events replacement was judged not worth the extra interaction surface
-// over the buttons alone.)
-function renderRankList(candidates) {
-  const list = $('v-rank-list');
-  list.innerHTML = '';
-  candidates.forEach((name, id) => {
-    const li = document.createElement('li');
-    li.dataset.id = String(id);
-    li.innerHTML = `
-      <span class="rank-pos"></span>
-      <span class="rank-name"></span>
-      <span class="rank-moves">
-        <button type="button" class="ghost" data-dir="-1" title="Move up">▲</button>
-        <button type="button" class="ghost" data-dir="1" title="Move down">▼</button>
-      </span>`;
-    li.querySelector('.rank-name').textContent = name;
-    list.appendChild(li);
-  });
-  renumberRankList();
-
-  list.querySelectorAll('.rank-moves button').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const li = btn.closest('li');
-      const dir = Number(btn.dataset.dir);
-      const sibling = dir < 0 ? li.previousElementSibling : li.nextElementSibling;
-      if (!sibling) return;
-      if (dir < 0) list.insertBefore(li, sibling);
-      else list.insertBefore(sibling, li);
-      renumberRankList();
+  // ---------- step state ----------
+  function setStep(name, opts = {}) {
+    v.step = name;
+    const idx = STEPS.indexOf(name);
+    $$('.vstep').forEach((el) => {
+      const i = STEPS.indexOf(el.dataset.vstep);
+      el.classList.toggle('active', i === idx);
+      el.classList.toggle('done', i < idx);
+      el.classList.toggle('locked', i > idx);
+      el.classList.toggle('blocked', !!opts.blocked && i === idx);
     });
-  });
-}
+  }
+  function status(el, html, kind = '') {
+    el.className = `status-line ${kind}`;
+    el.innerHTML = html;
+  }
+  const spin = (t) => `<span class="spinner"></span> ${esc(t)}`;
+  const okLine = (t) => `${icon('check')} ${t}`;
+  const errLine = (t) => `${icon('alert')} ${t}`;
 
-function renumberRankList() {
-  $('v-rank-list')
-    .querySelectorAll('li')
-    .forEach((li, i) => {
-      li.querySelector('.rank-pos').textContent = String(i + 1);
-    });
-}
+  // ---------- chain helpers (through the wallet) ----------
+  const utxoId = (resource, commitment) => `utxo_${resource.replace('resource_', '')}_${commitment}`;
+  async function isLive(resource, commitment) {
+    try {
+      const res = await window.tari.request({ method: 'tari_getSubstate', params: { substateId: utxoId(resource, commitment), version: null } });
+      if (res?.state && !('up' in res.state)) return false;
+      const value = res?.state?.up?.substate ?? res?.substate;
+      const utxo = value?.Utxo ?? value?.substate?.Utxo;
+      return !!(utxo && utxo.output);
+    } catch {
+      return false;
+    }
+  }
+  async function ensureView() {
+    let r = await window.tari.request({ method: 'tari_getViewAccess' });
+    if (!r?.granted) r = await window.tari.request({ method: 'tari_requestViewAccess' });
+    if (!r?.granted) throw new Error('Private view access is needed so your wallet can look for your ballot.');
+  }
+  function rankingCbor(ids) {
+    const head = (n) => (n < 24 ? [n] : n < 256 ? [0x18, n] : [0x19, n >> 8, n & 255]);
+    const bytes = [...(ids.length < 24 ? [0x80 | ids.length] : [0x98, ids.length]), ...ids.flatMap(head)];
+    return bytes.map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
 
-function currentRanking() {
-  return Array.from($('v-rank-list').querySelectorAll('li')).map((li) => Number(li.dataset.id));
-}
-
-// The create -> poll -> submit helper lives in wallet.js (shared with the initiator console).
-
-// ---------- load the election ----------
-async function loadElection(id) {
-  try {
-    const e = await api(`/api/elections/${id}`);
-    election = e;
-    $('v-not-found').hidden = true;
-    $('v-title').textContent = e.title;
-    renderRankList(e.candidates);
-    const closed = e.status === 'ended' || (e.epoch != null && e.expiresAtEpoch != null && e.epoch > e.expiresAtEpoch);
-    if (closed) {
-      $('v-scan-row').hidden = true;
-      $('v-ballot-fields').hidden = true;
-      $('v-not-eligible').hidden = false;
-      $('v-not-eligible').textContent = 'This election is closed — no more ballots can be cast.';
+  // ---------- load ----------
+  async function init() {
+    const id = new URLSearchParams(location.search).get('election');
+    if (!id) return showPicker();
+    try {
+      const e = await api(`/api/elections/${encodeURIComponent(id)}`);
+      v.election = e;
+    } catch {
+      $('#not-found').hidden = false;
       return;
     }
-    $('v-not-eligible').textContent = 'No ballot for this election\'s ballot resource was found in your wallet.';
-    if (voterAccount) await scanForBallot();
-  } catch {
-    $('v-not-found').hidden = false;
-  }
-}
-
-async function populatePicker() {
-  const list = await api('/api/elections');
-  const sel = $('election-select');
-  list.forEach((e) => {
-    const opt = document.createElement('option');
-    opt.value = e.id;
-    opt.textContent = e.title;
-    sel.appendChild(opt);
-  });
-  $('election-picker').hidden = false;
-}
-
-$('election-select').addEventListener('change', () => {
-  const id = $('election-select').value;
-  if (id) loadElection(id);
-});
-
-// ---------- wallet + eligibility ----------
-// Eligibility is decided *entirely* on-chain: whether this wallet can decrypt a ballot UTXO of
-// this election's own ballot resource. Deliberately never consults this site's own voter-list
-// bookkeeping (election.voters) -- that list only exists to drive the mint at election creation,
-// and a server-held record of who's allowed to vote is exactly the kind of thing a private ballot
-// scheme shouldn't depend on to answer "can I vote."
-
-// Prompts once (a no-op thereafter) for the private-view grant this account's confidential reads
-// need -- shared by the ballot scan below and the fee-shield check.
-async function ensureViewAccess() {
-  let view = await window.tari.request({ method: 'tari_getViewAccess' });
-  if (!view.granted) view = await window.tari.request({ method: 'tari_requestViewAccess' });
-  if (!view.granted) throw new Error('Private view access is required.');
-}
-
-async function scanForBallot() {
-  voterError('');
-  if (!voterAccount) {
-    voterError('Connect your wallet first.');
-    return false;
-  }
-  if (!election?.ballotResource) {
-    voterError('Election not loaded yet.');
-    return false;
-  }
-  $('btn-vote-scan').disabled = true;
-  $('v-not-eligible').hidden = true;
-  $('v-scan-status').textContent = 'checking view access…';
-  try {
-    await ensureViewAccess();
-
-    // Cheap path first: if the wallet already holds/knows about a ballot for this resource (e.g.
-    // a previous scan on this page already found and recorded it), that alone is enough to vote --
-    // no need to pay for another chain walk just to re-confirm something already established.
-    $('v-scan-status').textContent = 'checking your wallet…';
-    const known = await window.tari.request({ method: 'tari_getShieldedOutputs', params: { resourceAddress: election.ballotResource } });
-    let match = known?.[0];
-
-    if (!match) {
-      $('v-scan-status').textContent = "checking the election's creation transaction for your ballot…";
-      // Every ballot for this election was minted in exactly one transaction -- the election's own
-      // creation (see lib/mint.mjs). Checking that transaction id directly turns this into a single
-      // lookup instead of a blind walk over recent chain history, which is both far faster and
-      // avoids retrying every unrelated transaction the indexer happens to have served up recently.
-      const { found } = await window.tari.request({
-        method: 'tari_scanForResourceUtxos',
-        params: {
-          resourceAddress: election.ballotResource,
-          transactionIds: election.txId ? [election.txId] : [],
-          maxPages: 20,
-          pageSize: 50,
-          limit: 1,
-        },
-      });
-      match = found?.[0];
+    const e = v.election;
+    const ph = phaseOf(e);
+    const m = METHODS[e.tallyMethod] ?? METHODS.irv;
+    document.title = `${e.title} · Vote · Privote`;
+    $('#ballot').hidden = false;
+    $('#v-badges').innerHTML = `${badge(ph)}<span class="badge outline">${esc(m.name)}</span>`;
+    $('#v-title').textContent = e.title;
+    $('#v-sub').innerHTML = `${(e.candidates ?? []).length} candidates${e.numWinners > 1 ? ` · ${e.numWinners} seats` : ''} · ${ph.endsAt ? `closes ${esc(relTime(ph.endsAt))} (${esc(fmtDate(ph.endsAt))})` : `closes at epoch ${e.expiresAtEpoch}`}`;
+    $('#done-results').href = `/#/e/${encodeURIComponent(e.id)}`;
+    $('#v-results-link').href = `/#/e/${encodeURIComponent(e.id)}`;
+    if (ph.key === 'ended' || ph.key === 'expired') {
+      $('#v-closed').hidden = false;
+      $('#vflow').hidden = true;
+      return;
     }
-
-    if (!match) {
-      $('v-scan-status').textContent = '';
-      $('v-not-eligible').hidden = false;
-      $('v-ballot-fields').hidden = true;
-      return false;
+    v.order = (e.candidates ?? []).map((_, i) => i);
+    setupRanking(m);
+    if (!window.tari) {
+      // tari-connector.js may still be injecting window.tari inside Universe.
+      setTimeout(() => { if (!window.tari) $('#no-wallet').hidden = false; }, 1200);
     }
-    ballotCommitment = match.commitment;
-    // The wallet may still hold a record of a ballot that was already spent (a previous
-    // visit). Ask the chain whether the output is still live before offering the cast.
+  }
+
+  async function showPicker() {
+    $('#picker').hidden = false;
+    const host = $('#picker-list');
+    host.innerHTML = '<div class="skeleton" style="height:64px"></div><div class="skeleton" style="height:64px"></div>';
     try {
-      const res = await window.tari.request({
-        method: 'tari_getSubstate',
-        params: { substateId: `utxo_${election.ballotResource.replace('resource_', '')}_${ballotCommitment}`, version: null },
-      });
-      const utxo = res?.substate?.Utxo;
-      if (!utxo || !utxo.output) throw new Error('spent');
-    } catch {
-      $('v-scan-status').textContent = '';
-      $('v-ballot-fields').hidden = true;
-      $('v-not-eligible').hidden = false;
-      $('v-not-eligible').textContent = 'This ballot has already been spent — you appear to have voted already.';
-      return false;
+      const [list, st] = await Promise.all([api('/api/elections'), UI.loadStatus()]);
+      const open = list.map((e) => ({ e, ph: phaseOf(e, st?.epoch) })).filter(({ ph }) => ph.key === 'open' || ph.key === 'closing');
+      host.innerHTML = open.length
+        ? open.map(({ e, ph }) => `<a class="pick" href="/vote?election=${encodeURIComponent(e.id)}">${avatar(e.title, e.title.length)}<span><span class="p-name">${esc(e.title)}</span><br><span class="small muted">${esc(METHODS[e.tallyMethod]?.short ?? '')} · ${ph.endsAt ? `closes ${esc(relTime(ph.endsAt))}` : ''}</span></span><span style="margin-left:auto">${icon('right', 'inline-svg')}</span></a>`).join('')
+        : `<div class="empty-state"><div class="ico">${icon('ballot')}</div><h3>No open elections</h3><p>When an election is running, it shows up here.</p></div>`;
+    } catch (e) {
+      host.innerHTML = `<div class="callout err">${icon('alert')}<div>${esc(e.message)}</div></div>`;
     }
-    $('v-scan-status').textContent = 'ballot found ✓';
-    $('v-ballot-fields').hidden = false;
-    $('btn-vote-cast').disabled = false;
-    await checkExistingFeeShield();
-    return true;
-  } catch (e) {
-    $('v-scan-status').textContent = '';
-    voterError(e?.message || String(e));
-    return false;
-  } finally {
-    $('btn-vote-scan').disabled = false;
   }
-}
 
-$('btn-vote-scan').addEventListener('click', scanForBallot);
+  // ---------- 1 connect ----------
+  $('#btn-connect').onclick = async () => {
+    if (!window.tari) {
+      $('#no-wallet').hidden = false;
+      return;
+    }
+    const btn = $('#btn-connect');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Waiting for wallet…';
+    try {
+      await window.tari.request({ method: 'tari_requestAccounts' });
+      v.wallet = await window.tari.request({ method: 'tari_getWalletAddress' });
+      $('#s1-sub').innerHTML = `<span class="wallet-chip">${avatar(v.wallet.slice(8), 3)}${esc(short(v.wallet, 12, 6))}</span>`;
+      setStep('find');
+      findBallot();
+    } catch (e) {
+      toast('Could not connect', e?.message || String(e), 'err');
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = `${icon('wallet')} Connect wallet`;
+    }
+  };
 
-$('btn-vote-connect').addEventListener('click', async () => {
-  voterError('');
-  if (!window.tari) {
-    voterError('No Tari wallet found — install Sapient or open this page from inside Tari Universe.');
-    return;
-  }
-  try {
-    // tari_requestAccounts resolves to the account's *component* address -- a different, unrelated
-    // string from the otl_... wallet address a ballot is actually minted to. Only the wallet
-    // address is meaningful here (it's what the on-chain scan below decrypts against).
-    await window.tari.request({ method: 'tari_requestAccounts' });
-    const walletAddress = await window.tari.request({ method: 'tari_getWalletAddress' });
-    voterAccount = walletAddress;
-    $('v-account').textContent = `connected: ${walletAddress.slice(0, 14)}…${walletAddress.slice(-8)}`;
-    $('v-scan-row').hidden = false;
-    if (election) await scanForBallot();
-  } catch (e) {
-    voterError(e?.message || String(e));
-  }
-});
-
-// ---------- fee (always private) ----------
-try {
-  const saved = localStorage.getItem(FEE_COMMITMENT_KEY);
-  if (saved) $('v-fee-commitment').value = saved;
-} catch {
-  /* private browsing or storage disabled -- the field just starts empty */
-}
-
-// If the wallet already holds shielded XTR, there's no reason to make the voter shield more --
-// pick the largest existing stealth UTXO (best chance of covering the fee) and use it. Best-effort:
-// a denial or failure here just leaves whatever was already in the field (localStorage, or blank),
-// and the voter can still shield manually.
-//
-// The wallet's own record of "unspent" can be stale (e.g. a previous cast attempt that spent this
-// exact output but got interrupted before the wallet's local bookkeeping caught up, or the output
-// was already used from another session/tab) -- confirmed live 2026-09-21 as the cause of a cast
-// failing with "Input substate ... is down" using a fee commitment this same check had just handed
-// back as good. The ballot-liveness check above (tari_getSubstate before offering to cast) already
-// guards against exactly this for the ballot itself; this is the same guard for the fee input,
-// walking candidates largest-first until one is confirmed still live on-chain.
-async function checkExistingFeeShield() {
-  try {
-    await ensureViewAccess();
-    const outputs = await window.tari.request({ method: 'tari_getShieldedOutputs', params: { resourceAddress: XTR_RESOURCE } });
-    if (!outputs || outputs.length === 0) return;
-    const candidates = [...outputs].sort((a, b) => (BigInt(b.amount) > BigInt(a.amount) ? 1 : -1));
-    for (const candidate of candidates) {
-      try {
-        const res = await window.tari.request({
-          method: 'tari_getSubstate',
-          params: { substateId: `utxo_${XTR_RESOURCE.replace('resource_', '')}_${candidate.commitment}`, version: null },
+  // ---------- 2 find ----------
+  async function findBallot() {
+    const e = v.election;
+    const st = $('#find-status');
+    $('#find-actions').hidden = true;
+    setStep('find');
+    try {
+      status(st, spin('Asking your wallet for permission to read private outputs…'));
+      await ensureView();
+      status(st, spin('Checking your wallet…'));
+      const known = await window.tari.request({ method: 'tari_getShieldedOutputs', params: { resourceAddress: e.ballotResource } });
+      let match = known?.[0];
+      if (!match) {
+        status(st, spin('Scanning the election’s mint transaction for a ballot addressed to you…'));
+        const { found } = await window.tari.request({
+          method: 'tari_scanForResourceUtxos',
+          params: { resourceAddress: e.ballotResource, transactionIds: e.txId ? [e.txId] : [], maxPages: 20, pageSize: 50, limit: 1 },
         });
-        if (!res?.substate?.Utxo?.output) continue; // stale record -- already spent, try the next
-        $('v-fee-commitment').value = candidate.commitment;
-        try {
-          localStorage.setItem(FEE_COMMITMENT_KEY, candidate.commitment);
-        } catch {
-          /* best-effort only */
-        }
-        $('v-fee-status').textContent = 'using your existing shielded XTR ✓';
+        match = found?.[0];
+      }
+      if (!match) {
+        status(st, errLine('This wallet has no ballot for this election. Check you connected the account that was invited.'), 'err');
+        $('#find-actions').hidden = false;
+        setStep('find', { blocked: true });
         return;
-      } catch {
-        continue; // not found / already spent -- try the next candidate
       }
-    }
-    // Every known output was already spent on-chain -- leave the field as-is (localStorage or
-    // blank) rather than pre-filling a doomed one; the voter shields fresh below.
-  } catch {
-    /* no existing shielded XTR, or the voter hasn't granted view access -- shield manually below */
-  }
-}
-
-$('btn-vote-shield-fee').addEventListener('click', async () => {
-  voterError('');
-  if (!voterAccount) {
-    voterError('Connect your wallet first.');
-    return;
-  }
-  $('btn-vote-shield-fee').disabled = true;
-  $('v-fee-status').textContent = 'shielding XTR for fees — waiting on wallet approval…';
-  try {
-    const result = await window.RcvWallet.submitTransactionRequest({ kind: 'shield', resourceAddress: XTR_RESOURCE, amount: FEE_SHIELD_AMOUNT });
-    $('v-fee-commitment').value = result.commitment;
-    try {
-      localStorage.setItem(FEE_COMMITMENT_KEY, result.commitment);
-    } catch {
-      /* best-effort only */
-    }
-    $('v-fee-status').textContent = 'shielded ✓ — ready to cover several ballot fees';
-  } catch (e) {
-    $('v-fee-status').textContent = '';
-    voterError(e?.message || String(e));
-  } finally {
-    $('btn-vote-shield-fee').disabled = false;
-  }
-});
-
-// ---------- cast ----------
-$('btn-vote-cast').addEventListener('click', async () => {
-  voterError('');
-  $('v-result').hidden = true;
-  if (!election || !voterAccount || !ballotCommitment) {
-    voterError('Connect an eligible wallet first.');
-    return;
-  }
-  const ranking = currentRanking();
-  const feeCommitmentHex = $('v-fee-commitment').value.trim().replace(/^0x/, '');
-  if (!feeCommitmentHex) {
-    voterError('This needs a stealth XTR UTXO to pay the fee from — click "Shield XTR for fees".');
-    return;
-  }
-
-  const followUpInstructions = [
-    {
-      CallMethod: {
-        call: { Address: election.componentAddress },
-        method: 'cast_ballot',
-        args: [{ Workspace: { id: 0, offset: null } }, { Literal: rankingCborHex(ranking) }],
-      },
-    },
-  ];
-
-  $('btn-vote-cast').disabled = true;
-  $('v-progress').hidden = false;
-  $('v-progress').textContent = 'waiting for wallet approval…';
-  try {
-    const caps = await window.tari.request({ method: 'tari_getCapabilities' });
-    // Always paid privately -- see the fee field's own hint: any other way links this transaction
-    // (including your ranking) to your wallet address on-chain.
-    if (!caps.stealthRedeemPrivateFee) throw new Error('This wallet cannot pay fees privately yet — update it.');
-    const result = await window.RcvWallet.submitTransactionRequest({
-      kind: 'redeemStealthOutputWithPrivateFee',
-      resourceAddress: election.ballotResource,
-      commitmentHex: ballotCommitment,
-      revealedAmount: BALLOT_REVEALED_AMOUNT,
-      followUpInstructions,
-      feeResourceAddress: XTR_RESOURCE,
-      feeCommitmentHex,
-      maxFee: FEE_MAX_FEE,
-      relatedComponents: [election.componentAddress],
-    });
-    if (result?.feeChangeCommitment) {
-      $('v-fee-commitment').value = result.feeChangeCommitment;
-      try {
-        localStorage.setItem(FEE_COMMITMENT_KEY, result.feeChangeCommitment);
-      } catch {
-        /* best-effort only */
+      status(st, spin('Ballot found. Checking it hasn’t been used…'));
+      if (!(await isLive(e.ballotResource, match.commitment))) {
+        status(st, `${icon('check')} You’ve already voted in this election. <a href="/#/e/${encodeURIComponent(e.id)}">See the results</a>`, 'ok');
+        setStep('find', { blocked: true });
+        return;
       }
+      v.ballot = match.commitment;
+      $('#s2-sub').innerHTML = `Ballot <code>${esc(short(v.ballot, 8, 6))}</code> is ready.`;
+      status(st, '');
+      setStep('rank');
+      prepareFee();
+    } catch (err) {
+      status(st, errLine(esc(err?.message || String(err))), 'err');
+      $('#find-actions').hidden = false;
+      setStep('find', { blocked: true });
     }
-    $('v-txid').textContent = result?.transactionId ?? '(no transaction id returned)';
-    $('v-result').hidden = false;
-    $('v-ballot-fields').hidden = true;
-  } catch (e) {
-    const msg = e?.message || String(e);
-    // "Input substate ... is down" is the indexer's wording for "already spent" -- if this exact
-    // fee commitment is the culprit, leaving it in the field (and in localStorage) just makes the
-    // next click fail the same way. Clear it and say plainly what to do instead of surfacing the
-    // raw indexer error.
-    if (/is down/i.test(msg) && msg.includes(feeCommitmentHex)) {
-      $('v-fee-commitment').value = '';
-      try {
-        localStorage.removeItem(FEE_COMMITMENT_KEY);
-      } catch {
-        /* best-effort only */
-      }
-      voterError('That shielded XTR was already spent (from an earlier attempt or elsewhere) — click "Shield XTR for fees" to get a fresh one, then cast again.');
-    } else {
-      voterError(msg);
-    }
-  } finally {
-    $('btn-vote-cast').disabled = false;
-    $('v-progress').hidden = true;
   }
-});
+  $('#btn-rescan').onclick = findBallot;
 
-// ---------- init ----------
-const params = new URLSearchParams(location.search);
-const electionId = params.get('election');
-if (electionId) {
-  loadElection(electionId);
-} else {
-  populatePicker().catch((e) => {
-    voterError(e?.message || String(e));
+  // ---------- 3 rank ----------
+  function setupRanking(m) {
+    const names = v.election.candidates ?? [];
+    if (!m.ranked) {
+      $('#rank-ui').hidden = true;
+      $('#pick-ui').hidden = false;
+      $('#s3-title').textContent = 'Make your choice';
+      $('#s3-sub').textContent = 'Pick one option.';
+      $('#pick-ui').innerHTML = names.map((n, i) => `<button type="button" class="pick" role="radio" aria-checked="false" data-id="${i}">${avatar(n, i)}<span class="p-name">${esc(n)}</span><span class="radio"></span></button>`).join('');
+      $('#pick-ui').onclick = (e) => {
+        const b = e.target.closest('[data-id]');
+        if (!b) return;
+        v.pick = Number(b.dataset.id);
+        $$('#pick-ui .pick').forEach((x) => x.setAttribute('aria-checked', String(x === b)));
+        $('#btn-rank-done').disabled = false;
+      };
+      $('#btn-rank-done').disabled = true;
+      return;
+    }
+    if (m.multi) $('#rank-hint').textContent = `Top is your first choice. ${v.election.numWinners} seats will be filled.`;
+    drawRank();
+  }
+
+  function drawRank(flipFrom) {
+    const names = v.election.candidates ?? [];
+    const list = $('#rank-list');
+    list.innerHTML = v.order.map((id, pos) => `<li class="rank-item" data-id="${id}">
+        <span class="grip" aria-hidden="true">${icon('grip')}</span>
+        <span class="pos">${v.tapMode ? (v.tapped.includes(id) ? v.tapped.indexOf(id) + 1 : '·') : pos + 1}</span>
+        ${avatar(names[id], id)}<span class="r-name">${esc(names[id])}</span>
+        <span class="moves"><button type="button" data-mv="-1" aria-label="Move ${esc(names[id])} up" ${pos === 0 ? 'disabled' : ''}>${icon('up')}</button><button type="button" data-mv="1" aria-label="Move ${esc(names[id])} down" ${pos === v.order.length - 1 ? 'disabled' : ''}>${icon('down')}</button></span>
+      </li>`).join('');
+    if (flipFrom) {
+      $$('.rank-item', list).forEach((el) => {
+        const prev = flipFrom.get(el.dataset.id);
+        if (prev == null) return;
+        const dy = prev - el.getBoundingClientRect().top;
+        if (!dy) return;
+        el.style.transform = `translateY(${dy}px)`;
+        requestAnimationFrame(() => { el.classList.add('flip'); el.style.transform = ''; });
+        el.addEventListener('transitionend', () => el.classList.remove('flip'), { once: true });
+      });
+    }
+  }
+  const positions = () => new Map($$('#rank-list .rank-item').map((el) => [el.dataset.id, el.getBoundingClientRect().top]));
+
+  $('#rank-list').addEventListener('click', (e) => {
+    const mv = e.target.closest('[data-mv]');
+    const li = e.target.closest('.rank-item');
+    if (!li) return;
+    const id = Number(li.dataset.id);
+    if (mv) {
+      const i = v.order.indexOf(id);
+      const j = i + Number(mv.dataset.mv);
+      if (j < 0 || j >= v.order.length) return;
+      const before = positions();
+      [v.order[i], v.order[j]] = [v.order[j], v.order[i]];
+      drawRank(before);
+      li.parentElement?.querySelector(`[data-id="${id}"] [data-mv="${mv.dataset.mv}"]`)?.focus();
+      return;
+    }
+    if (v.tapMode && !e.target.closest('.grip')) {
+      if (v.tapped.includes(id)) return;
+      v.tapped.push(id);
+      const before = positions();
+      const rest = v.order.filter((x) => !v.tapped.includes(x));
+      v.order = [...v.tapped, ...rest];
+      if (v.tapped.length >= v.order.length - 1) {
+        v.tapMode = false;
+        v.tapped = [];
+        $('#btn-tap-mode').innerHTML = `${icon('sparkles')} Tap to rank`;
+        toast('Ranking complete', 'Adjust with the arrows if you like.', 'ok', 2200);
+      }
+      drawRank(before);
+    }
   });
-}
+  $('#btn-tap-mode').onclick = () => {
+    v.tapMode = !v.tapMode;
+    v.tapped = [];
+    $('#btn-tap-mode').innerHTML = v.tapMode ? `${icon('x')} Cancel` : `${icon('sparkles')} Tap to rank`;
+    if (v.tapMode) toast('Tap candidates in order', 'Your first tap is your first choice.', 'info', 3000);
+    drawRank();
+  };
+  $('#btn-rank-reset').onclick = () => {
+    const before = positions();
+    v.order = (v.election.candidates ?? []).map((_, i) => i);
+    v.tapped = [];
+    drawRank(before);
+  };
+
+  // Pointer-events drag (HTML5 drag-and-drop does not work in Tari Universe's dApp iframe).
+  (function enableDrag() {
+    const list = $('#rank-list');
+    let drag = null;
+    list.addEventListener('pointerdown', (e) => {
+      const grip = e.target.closest('.grip');
+      if (!grip || v.tapMode) return;
+      const li = grip.closest('.rank-item');
+      e.preventDefault();
+      grip.setPointerCapture(e.pointerId);
+      const rect = li.getBoundingClientRect();
+      drag = { li, id: Number(li.dataset.id), startY: e.clientY, offset: 0, h: rect.height + 8, grip, pointerId: e.pointerId };
+      li.classList.add('dragging');
+    });
+    list.addEventListener('pointermove', (e) => {
+      if (!drag) return;
+      const dy = e.clientY - drag.startY;
+      drag.li.style.transform = `translateY(${dy}px)`;
+      const i = v.order.indexOf(drag.id);
+      const shift = Math.round(dy / drag.h);
+      const target = Math.max(0, Math.min(v.order.length - 1, i + shift));
+      $$('.rank-item', list).forEach((el) => {
+        if (el === drag.li) return;
+        const j = v.order.indexOf(Number(el.dataset.id));
+        let t = 0;
+        if (target > i && j > i && j <= target) t = -drag.h;
+        if (target < i && j < i && j >= target) t = drag.h;
+        el.style.transition = 'transform .18s cubic-bezier(.2,.8,.2,1)';
+        el.style.transform = t ? `translateY(${t}px)` : '';
+      });
+      drag.target = target;
+    });
+    const finish = () => {
+      if (!drag) return;
+      const i = v.order.indexOf(drag.id);
+      const target = drag.target ?? i;
+      v.order.splice(i, 1);
+      v.order.splice(target, 0, drag.id);
+      drag = null;
+      drawRank();
+    };
+    list.addEventListener('pointerup', finish);
+    list.addEventListener('pointercancel', finish);
+  })();
+
+  $('#btn-rank-done').onclick = () => {
+    const m = METHODS[v.election.tallyMethod] ?? METHODS.irv;
+    if (!m.ranked && v.pick == null) return;
+    const names = v.election.candidates ?? [];
+    const ids = m.ranked ? v.order : [v.pick];
+    $('#review').innerHTML = ids.map((id) => `<li>${esc(names[id])}</li>`).join('');
+    $('#review').style.listStyle = m.ranked ? '' : 'none';
+    $('#review').style.paddingLeft = m.ranked ? '20px' : '0';
+    setStep('cast');
+    updateCastButton();
+  };
+  $('#btn-edit').onclick = () => setStep('rank');
+
+  // ---------- 4 fee + cast ----------
+  async function prepareFee() {
+    const st = $('#fee-status');
+    status(st, spin('Looking for shielded TARI to pay the fee privately…'));
+    $('#fee-actions').hidden = true;
+    const saved = UI.store.get(FEE_KEY);
+    try {
+      const outputs = (await window.tari.request({ method: 'tari_getShieldedOutputs', params: { resourceAddress: XTR } })) ?? [];
+      const sorted = [...outputs].sort((a, b) => (BigInt(b.amount) > BigInt(a.amount) ? 1 : -1));
+      if (saved && !sorted.some((o) => o.commitment === saved)) sorted.unshift({ commitment: saved, amount: '0' });
+      for (const o of sorted) {
+        if (o.amount !== '0' && BigInt(o.amount) < BigInt(MAX_FEE)) continue;
+        if (await isLive(XTR, o.commitment)) {
+          setFee(o.commitment, o.amount);
+          return;
+        }
+      }
+    } catch { /* fall through to shield */ }
+    v.fee = null;
+    status(st, `${icon('info')} You need a little shielded TARI so the fee can’t be traced to you.`);
+    $('#fee-actions').hidden = false;
+    updateCastButton();
+  }
+  function setFee(commitment, amount) {
+    v.fee = commitment;
+    UI.store.set(FEE_KEY, commitment);
+    $('#fee-commitment').value = commitment;
+    const amt = amount && amount !== '0' ? ` (${(Number(amount) / 1e6).toLocaleString(undefined, { maximumFractionDigits: 3 })} tTARI)` : '';
+    status($('#fee-status'), okLine(`Fee will be paid privately from shielded TARI${esc(amt)}.`), 'ok');
+    $('#fee-actions').hidden = true;
+    updateCastButton();
+  }
+  $('#fee-commitment').addEventListener('change', (e) => {
+    const c = e.target.value.trim().replace(/^0x/, '').toLowerCase();
+    if (/^[0-9a-f]{64}$/.test(c)) setFee(c);
+    else if (c) toast('That is not a commitment', 'Expected 64 hex characters.', 'err');
+  });
+  $('#btn-shield').onclick = async () => {
+    const b = $('#btn-shield');
+    b.disabled = true;
+    status($('#fee-status'), spin('Approve the shield in your wallet…'));
+    try {
+      const r = await window.RcvWallet.submitTransactionRequest({ kind: 'shield', resourceAddress: XTR, amount: FEE_SHIELD });
+      setFee(r.commitment, FEE_SHIELD);
+      toast('Shielded 0.5 tTARI', 'Enough for several private ballots.', 'ok');
+    } catch (e) {
+      status($('#fee-status'), errLine(esc(e?.message || String(e))), 'err');
+    } finally {
+      b.disabled = false;
+    }
+  };
+  function updateCastButton() {
+    $('#btn-cast').disabled = !(v.ballot && v.fee && v.step === 'cast');
+  }
+
+  $('#btn-cast').onclick = async () => {
+    const e = v.election;
+    const m = METHODS[e.tallyMethod] ?? METHODS.irv;
+    const ids = m.ranked ? v.order : [v.pick];
+    const btn = $('#btn-cast');
+    const st = $('#cast-status');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Casting…';
+    try {
+      const caps = await window.tari.request({ method: 'tari_getCapabilities' });
+      if (!caps?.stealthRedeemPrivateFee) throw new Error('This wallet cannot pay fees privately yet. Update Sapient or Tari Universe and try again.');
+      status(st, spin('Approve the ballot in your wallet…'));
+      const result = await window.RcvWallet.submitTransactionRequest({
+        kind: 'redeemStealthOutputWithPrivateFee',
+        resourceAddress: e.ballotResource,
+        commitmentHex: v.ballot,
+        revealedAmount: BALLOT_AMOUNT,
+        followUpInstructions: [{ CallMethod: { call: { Address: e.componentAddress }, method: 'cast_ballot', args: [{ Workspace: { id: 0, offset: null } }, { Literal: rankingCbor(ids) }] } }],
+        feeResourceAddress: XTR,
+        feeCommitmentHex: v.fee,
+        maxFee: MAX_FEE,
+        relatedComponents: [e.componentAddress],
+      });
+      if (result?.feeChangeCommitment) UI.store.set(FEE_KEY, result.feeChangeCommitment);
+      status(st, '');
+      $('#vflow').hidden = true;
+      $('#done').hidden = false;
+      const tx = result?.transactionId;
+      $('#done-tx').hidden = !tx;
+      if (tx) $('#done-tx').href = explorer.tx(tx);
+      UI.confetti($('#done'));
+      $('#done').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    } catch (err) {
+      const msg = err?.message || String(err);
+      if (/is down|already spent/i.test(msg) && v.fee && msg.includes(v.fee)) {
+        UI.store.del(FEE_KEY);
+        v.fee = null;
+        status(st, errLine('That shielded TARI was already spent. Shield a fresh amount and cast again.'), 'err');
+        prepareFee();
+      } else {
+        status(st, errLine(esc(msg)), 'err');
+      }
+    } finally {
+      btn.innerHTML = `${icon('vote')} Cast ballot`;
+      updateCastButton();
+    }
+  };
+
+  init();
+})();

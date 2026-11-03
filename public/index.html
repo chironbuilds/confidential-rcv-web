@@ -2,211 +2,271 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Confidential Ranked-Choice Voting — Tari Ootle</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Privote · Private voting on Tari</title>
+  <meta name="description" content="Confidential ranked-choice voting on Tari Ootle. Stealth ballots keep who voted private; the tally runs on-chain." />
+  <meta name="theme-color" content="#07080f" />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" />
   <link rel="stylesheet" href="/style.css" />
-  <!-- Provides window.tari when this page is opened inside Tari Universe's own dApp browser (an
-       iframe, not an ordinary tab) -- a no-op when an extension like Sapient already owns
-       window.tari. See https://universe.tari.mw/integration. -->
+  <!-- Provides window.tari inside Tari Universe's dApp browser; a no-op when an extension such as
+       Sapient already provides it. See https://universe.tari.mw/integration. -->
   <script src="https://universe.tari.mw/tari-connector.js"></script>
 </head>
 <body>
-  <header>
-    <div class="brand">
-      <h1>Confidential Ranked-Choice Voting</h1>
-      <p class="sub">Tari Ootle · stealth ballots · trustless IRV tally</p>
-    </div>
-    <div class="statusbar" id="statusbar">
-      <span class="pill" id="pill-network">network …</span>
-      <span class="pill" id="pill-epoch">epoch …</span>
-      <span class="pill" id="pill-template" title="template address">template …</span>
+  <header class="topbar">
+    <div class="shell">
+      <a class="brand" href="#/">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a28bff"/><stop offset=".5" stop-color="#6f7dff"/><stop offset="1" stop-color="#45d0e6"/></linearGradient></defs><rect width="32" height="32" rx="9" fill="url(#bg)"/><path d="M9 16.5l4.2 4.2L23 11" fill="none" stroke="#0a0820" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Privote <small>testnet</small>
+      </a>
+      <nav class="nav" aria-label="Main">
+        <a href="#/" data-nav="home">Elections</a>
+        <a href="#/new" data-nav="new">Create</a>
+        <a href="/vote">Vote</a>
+      </nav>
+      <div class="topbar-right">
+        <span class="net-chip" id="net-chip"><span class="dot"></span> connecting…</span>
+        <button class="icon-btn" id="btn-theme" aria-label="Toggle theme"></button>
+      </div>
     </div>
   </header>
 
   <main>
-    <section class="elections-bar">
-      <span class="hint">Here to cast a ballot, not run an election?</span>
-      <a href="/vote" class="ghost">Go to the voting page →</a>
+    <!-- ================= HOME ================= -->
+    <section class="view shell" id="view-home" hidden>
+      <div class="hero">
+        <div>
+          <span class="eyebrow">Confidential voting on Tari Ootle</span>
+          <h1 class="mt-12">Every vote counts.<br /><span class="grad-text">No vote is traced.</span></h1>
+          <p class="lede">Run ranked-choice elections where each voter gets a stealth ballot. No one, not even the organiser, can link a ballot to a wallet, and the count runs on-chain where anyone can check it.</p>
+          <div class="btn-row">
+            <a class="btn btn-primary btn-lg" href="#/new" data-icon="plus">Create an election</a>
+            <a class="btn btn-lg" href="/vote" data-icon="vote">Cast my ballot</a>
+          </div>
+          <div class="hero-facts">
+            <span data-icon="check">Stealth ballot per voter</span>
+            <span data-icon="check">IRV, STV, sequential IRV and FPTP</span>
+            <span data-icon="check">Verifiable on-chain tally</span>
+          </div>
+        </div>
+        <div class="hero-visual" aria-hidden="true">
+          <div class="ballot-art">
+            <div class="ba-head"><span class="ba-title">Council election</span><span class="badge open"><span class="dot"></span>Live tally</span></div>
+            <div class="ba-row"><span class="rank">1</span><span class="avatar" style="--c:#8b7bff;width:28px;height:28px;font-size:11px">AL</span><span class="bar"><i style="width:82%"></i></span></div>
+            <div class="ba-row"><span class="rank">2</span><span class="avatar" style="--c:#4fd1e8;width:28px;height:28px;font-size:11px">BO</span><span class="bar"><i style="width:61%"></i></span></div>
+            <div class="ba-row"><span class="rank">3</span><span class="avatar" style="--c:#f472b6;width:28px;height:28px;font-size:11px">CY</span><span class="bar"><i style="width:43%"></i></span></div>
+            <div class="ba-row"><span class="rank">4</span><span class="avatar" style="--c:#f6c453;width:28px;height:28px;font-size:11px">DI</span><span class="bar"><i style="width:24%"></i></span></div>
+            <div class="ba-foot" data-icon="eyeoff">Ballots are unlinkable to the wallets that cast them</div>
+          </div>
+          <div class="lock-float" data-icon="lock"></div>
+        </div>
+      </div>
+
+      <div class="section-title"><h2>Elections</h2>
+        <div class="btn-row"><button class="btn btn-sm btn-ghost" id="btn-refresh-list" data-icon="refresh">Refresh</button></div>
+      </div>
+      <div class="pills" id="filter-pills" role="group" aria-label="Filter elections">
+        <button class="pill-btn" data-filter="all" aria-pressed="true">All</button>
+        <button class="pill-btn" data-filter="open" aria-pressed="false">Open</button>
+        <button class="pill-btn" data-filter="ended" aria-pressed="false">Finished</button>
+      </div>
+      <div class="elections mt-16" id="election-grid"></div>
+
+      <div class="mt-48">
+        <div class="section-title"><h2>How it works</h2></div>
+        <div class="grid grid-3 how">
+          <div class="card how-step"><div class="ico" data-icon="users"></div><div class="num mt-16">01</div><h3>Add voters</h3><p>Paste wallet addresses. Each one gets exactly one stealth ballot token, minted on-chain in a single transaction.</p></div>
+          <div class="card how-step"><div class="ico" data-icon="eyeoff"></div><div class="num mt-16">02</div><h3>Vote privately</h3><p>Voters rank the candidates from their own wallet. The ballot is spent with a one-time key and the fee is paid privately, so nothing links it back.</p></div>
+          <div class="card how-step"><div class="ico" data-icon="chart"></div><div class="num mt-16">03</div><h3>Count on-chain</h3><p>The template runs the runoff itself. Every round is public, so anyone can verify the result without trusting this site.</p></div>
+        </div>
+      </div>
     </section>
 
-    <section class="elections-bar">
-      <label for="election-select">Load election</label>
-      <select id="election-select"><option value="">— none —</option></select>
-      <button id="btn-refresh-list" class="ghost">Refresh</button>
+    <!-- ================= CREATE ================= -->
+    <section class="view shell" id="view-new" hidden>
+      <div class="page-head">
+        <div><span class="eyebrow">New election</span><h1 class="mt-8">Create an election</h1><p>Four quick steps. Nothing goes on-chain until you press <b>Launch</b>.</p></div>
+      </div>
+      <div class="wizard">
+        <div>
+          <div class="wizard-steps" role="tablist" id="wizard-steps">
+            <button class="wstep active" data-step="0" role="tab"><span class="n"><span>1</span></span>Basics</button>
+            <button class="wstep" data-step="1" role="tab"><span class="n"><span>2</span></span>Candidates</button>
+            <button class="wstep" data-step="2" role="tab"><span class="n"><span>3</span></span>Voters</button>
+            <button class="wstep" data-step="3" role="tab"><span class="n"><span>4</span></span>Launch</button>
+          </div>
+
+          <!-- step 1 -->
+          <div class="card wizard-panel active" data-panel="0">
+            <div class="field">
+              <label class="label" for="in-title">Election title</label>
+              <input class="input input-lg" id="in-title" maxlength="200" placeholder="e.g. Community council 2026" autocomplete="off" />
+            </div>
+            <div class="field">
+              <div class="label">Counting method</div>
+              <div class="choices" id="method-choices" role="radiogroup"></div>
+            </div>
+            <div class="field" id="winners-field">
+              <div class="label">Seats to fill <span class="opt" id="winners-hint"></span></div>
+              <div class="stepper-num"><button type="button" id="win-dec" aria-label="Fewer seats">−</button><output id="in-winners">2</output><button type="button" id="win-inc" aria-label="More seats">+</button></div>
+            </div>
+            <div class="field">
+              <div class="label">Voting closes</div>
+              <div class="pills" id="deadline-pills"></div>
+              <input class="input mt-8" type="datetime-local" id="in-end" hidden />
+              <p class="help" id="end-preview"></p>
+            </div>
+          </div>
+
+          <!-- step 2 -->
+          <div class="card wizard-panel" data-panel="1">
+            <div class="card-head"><div><h2>Candidates</h2><p>Add at least two. Paste a list to add several at once.</p></div><span class="badge" id="cand-count">0</span></div>
+            <div class="input-row">
+              <input class="input" id="in-candidate" placeholder="Candidate or option name" maxlength="80" autocomplete="off" />
+              <button class="btn btn-primary" id="btn-add-candidate" data-icon="plus">Add</button>
+            </div>
+            <div class="pills mt-12" id="cand-presets">
+              <button class="pill-btn" data-preset="yesno">Yes / No</button>
+              <button class="pill-btn" data-preset="yna">Yes / No / Abstain</button>
+            </div>
+            <ul class="cand-list mt-16" id="candidate-list"></ul>
+            <div class="empty-state mt-16" id="cand-empty" style="padding:28px"><p>No candidates yet.</p></div>
+          </div>
+
+          <!-- step 3 -->
+          <div class="card wizard-panel" data-panel="2">
+            <div class="card-head"><div><h2>Voters</h2><p>One Ootle wallet address per line, or drop a CSV. Each address gets one stealth ballot.</p></div>
+              <button class="btn btn-sm" id="btn-csv" data-icon="upload">Import CSV</button><input type="file" id="csv-file" accept=".csv,.txt,text/csv" hidden />
+            </div>
+            <div class="dropzone" id="voter-drop">
+              <textarea class="textarea" id="in-voters" rows="9" spellcheck="false" placeholder="otl_esm_1…&#10;otl_esm_1…"></textarea>
+              <div class="dropzone-hint">Drop CSV to import</div>
+            </div>
+            <div class="mt-12"><div class="meter" id="voter-meter"><span></span></div></div>
+            <div class="stat-line mt-8" id="voter-stats"></div>
+            <ul class="issue-list mt-12" id="voter-issues" hidden></ul>
+            <div class="callout mt-16"><span data-icon="eyeoff"></span><div><b>Privote forgets these addresses.</b> They are used once to mint the ballots and are never stored next to a ballot, so the server cannot say who holds which one. Up to <b id="max-voters">16</b> voters per election on this network.</div></div>
+          </div>
+
+          <!-- step 4 -->
+          <div class="card wizard-panel" data-panel="3">
+            <div class="card-head"><div><h2>Who launches it?</h2><p>The launcher pays the fee and becomes the initiator, the only one who can end voting early.</p></div></div>
+            <div class="choices" id="signer-choices" role="radiogroup">
+              <button type="button" class="choice" role="radio" aria-checked="true" data-signer="server"><span class="check"></span>
+                <span class="choice-title"><span class="choice-icon" data-icon="server"></span>Privote's account</span>
+                <span class="choice-desc">Easiest. No wallet needed; the Privote server pays the fee.</span><span class="tag">Recommended</span></button>
+              <button type="button" class="choice" role="radio" aria-checked="false" data-signer="wallet"><span class="check"></span>
+                <span class="choice-title"><span class="choice-icon" data-icon="wallet"></span>My wallet</span>
+                <span class="choice-desc">Sign with Sapient or Tari Universe. You pay the fee and only you can end the vote early.</span></button>
+            </div>
+            <div class="flex mt-16" id="wallet-row" hidden>
+              <button class="btn btn-sm" id="btn-init-connect" data-icon="wallet">Connect wallet</button><span class="small muted" id="init-wallet-account"></span>
+            </div>
+            <hr class="divider" />
+            <div id="launch-summary"></div>
+            <div class="status-line mt-16" id="launch-status"></div>
+          </div>
+
+          <div class="wizard-nav">
+            <button class="btn btn-ghost" id="btn-back" data-icon="left">Back</button>
+            <button class="btn btn-primary" id="btn-next">Continue</button>
+          </div>
+        </div>
+
+        <aside class="wizard-aside">
+          <div class="card preview-card">
+            <div class="flex"><span class="eyebrow">Preview</span><span class="grow"></span><span class="badge" id="pv-method">—</span></div>
+            <div class="p-title empty mt-8" id="pv-title">Untitled election</div>
+            <div class="p-cands" id="pv-cands"></div>
+            <div class="p-rows">
+              <div class="p-row"><span>Seats</span><span id="pv-seats">1</span></div>
+              <div class="p-row"><span>Voters</span><span id="pv-voters">0</span></div>
+              <div class="p-row"><span>Closes</span><span id="pv-closes">—</span></div>
+            </div>
+            <ul class="checklist" id="pv-checks"></ul>
+          </div>
+        </aside>
+      </div>
     </section>
 
-    <!-- Step 1: settings -->
-    <details class="step" id="step-settings" open>
-      <summary><span class="step-num">1</span> Election settings</summary>
-      <div class="step-body">
-        <div class="field">
-          <label for="in-title">Title</label>
-          <input id="in-title" type="text" placeholder="e.g. Council election 2026" maxlength="200" />
-        </div>
-        <div class="field">
-          <label for="in-method">Voting method (tally)</label>
-          <select id="in-method">
-            <option value="irv">IRV — single winner, instant-runoff</option>
-            <option value="sequential-irv" selected>Sequential IRV — multi-winner, repeat IRV</option>
-            <option value="stv">STV — multi-winner, proportional (Droop quota)</option>
-            <option value="fptp">FPTP — first past the post (single-winner, plurality)</option>
-          </select>
-          <p class="hint">Pinned at election creation — the tally method cannot be changed afterwards.</p>
-        </div>
-        <div class="field">
-          <label for="in-winners">Number of winners</label>
-          <input id="in-winners" type="number" min="1" max="50" value="1" />
-          <p class="hint" id="hint-winners">With one winner the tally is single-winner IRV regardless of method.</p>
-        </div>
-        <div class="field">
-          <label>Candidates</label>
-          <ul id="candidate-list" class="candidate-list"></ul>
-          <div class="row">
-            <input id="in-candidate" type="text" placeholder="Candidate name" />
-            <button id="btn-add-candidate" class="ghost">Add</button>
+    <!-- ================= ELECTION ================= -->
+    <section class="view shell" id="view-election" hidden>
+      <a href="#/" class="btn btn-sm btn-ghost" data-icon="left" style="margin-left:-10px">All elections</a>
+      <div id="e-loading" class="mt-24"><div class="skeleton" style="height:44px;width:60%"></div><div class="skeleton mt-16" style="height:20px;width:40%"></div><div class="grid grid-4 mt-32"><div class="skeleton" style="height:96px"></div><div class="skeleton" style="height:96px"></div><div class="skeleton" style="height:96px"></div><div class="skeleton" style="height:96px"></div></div></div>
+      <div id="e-missing" class="empty-state mt-24" hidden><div class="ico" data-icon="search"></div><h3>Election not found</h3><p>It may belong to a previous network reset.</p><a class="btn" href="#/">Back to elections</a></div>
+      <div id="e-body" hidden>
+        <div class="e-hero mt-16">
+          <div>
+            <div class="flex" id="e-badges"></div>
+            <h1 class="mt-12" id="e-title"></h1>
+            <div class="sub" id="e-sub"></div>
           </div>
+          <div class="countdown" id="e-countdown"></div>
         </div>
-        <div class="field">
-          <label for="in-end-utc">Voting deadline (UTC)</label>
-          <input id="in-end-utc" type="datetime-local" />
-          <p class="hint">Times are UTC — the vote closes at the first epoch boundary at or after this time (~20–30 min per epoch, approximate).</p>
-          <p class="hint" id="end-preview">…</p>
-        </div>
-      </div>
-    </details>
 
-    <!-- Step 2: voters -->
-    <details class="step" id="step-voters">
-      <summary><span class="step-num">2</span> Voters</summary>
-      <div class="step-body">
-        <div class="field">
-          <label for="in-voters">Voter addresses (one per line)</label>
-          <textarea id="in-voters" rows="8" spellcheck="false"
-            placeholder="otl_esm_1…&#10;otl_esm_1…&#10;otl_esm_1…"></textarea>
-          <p class="hint">Each address receives exactly one stealth ballot token at initiation. Voters spend it from their own wallet — this site never touches voter keys.</p>
+        <div class="stats">
+          <div class="stat" style="display:flex;gap:16px;align-items:center"><div class="ring" id="e-ring" style="--size:76px"><div><b id="e-turnout" style="font-size:17px">0%</b></div></div><div><div class="s-label">Turnout</div><div class="s-value" id="e-cast">—</div><div class="s-sub" id="e-cast-sub">ballots cast</div></div></div>
+          <div class="stat"><div class="s-label" data-icon="users">Eligible voters</div><div class="s-value" id="e-voters">—</div><div class="s-sub">one stealth ballot each</div></div>
+          <div class="stat"><div class="s-label" data-icon="clock">Deadline</div><div class="s-value" id="e-deadline" style="font-size:18px">—</div><div class="s-sub" id="e-deadline-sub"></div></div>
+          <div class="stat"><div class="s-label" data-icon="layers">Method</div><div class="s-value" id="e-method" style="font-size:18px">—</div><div class="s-sub" id="e-method-sub"></div></div>
         </div>
-        <div class="row">
-          <button id="btn-csv" class="ghost">Import CSV …</button>
-          <span class="voter-count" id="voter-count">0 voters</span>
-        </div>
-      </div>
-    </details>
 
-    <!-- Step 3: initiate -->
-    <details class="step" id="step-initiate">
-      <summary><span class="step-num">3</span> Review &amp; initiate</summary>
-      <div class="step-body">
-        <table class="summary" id="init-summary"></table>
-        <div class="field">
-          <label>Who signs this?</label>
-          <div class="row">
-            <label><input type="radio" name="init-signer" id="init-signer-server" value="server" checked /> This server's account</label>
-            <label><input type="radio" name="init-signer" id="init-signer-wallet" value="wallet" /> My own wallet (Sapient / Tari Universe)</label>
+        <div class="two-col">
+          <div>
+            <div class="card">
+              <div class="card-head"><div><h2>Results</h2><p id="e-results-hint">The tally updates live as ballots arrive.</p></div><span class="small muted" id="e-updated"></span></div>
+              <div id="e-results"></div>
+            </div>
+            <div class="card mt-16" id="e-verify">
+              <div class="card-head"><div><h2>Verify the count</h2><p>Every ballot is public, but none carries an identity. Recount them yourself with the template's own tally code, running in your browser.</p></div>
+                <button class="btn btn-sm" id="btn-recount" data-icon="shield">Recount</button></div>
+              <div class="status-line" id="recount-status"></div>
+              <div class="table-wrap mt-12" style="max-height:300px"><table class="data" id="e-public-ballots"></table></div>
+            </div>
+            <details class="disclosure mt-16"><summary data-icon="code">Raw tally result</summary><div class="d-body"><pre class="code" id="e-raw">—</pre></div></details>
+            <details class="disclosure"><summary>Minted ballot commitments <span class="badge" id="e-ballot-count">0</span></summary>
+              <div class="d-body">
+                <p class="small muted">Privote keeps the commitments but never which address each belongs to. Voters find their own ballot by scanning the chain from their wallet.</p>
+                <div class="table-wrap mt-12" style="max-height:320px"><table class="data" id="e-ballots"></table></div>
+                <button class="btn btn-sm mt-12" id="btn-ballots-csv" data-icon="download">Download CSV</button>
+              </div></details>
           </div>
-          <p class="hint" id="init-signer-hint">
-            The server's own account pays the fee and is recorded as this election's initiator — simplest, no wallet needed.
-          </p>
-          <div class="row" id="init-wallet-row" hidden>
-            <button id="btn-init-connect" class="ghost">Connect wallet</button>
-            <span class="hint" id="init-wallet-account"></span>
+          <div>
+            <div class="card">
+              <div class="card-head"><div><h3>Invite voters</h3><p>One link for everyone. Each wallet finds its own ballot.</p></div></div>
+              <div class="share-box"><code id="e-link"></code><button class="btn btn-sm btn-primary" id="btn-copy-link" data-icon="copy">Copy</button></div>
+              <a class="btn btn-block mt-12" id="e-vote-btn" data-icon="vote">Open voting page</a>
+            </div>
+            <div class="card" id="e-admin">
+              <div class="card-head"><div><h3>Manage</h3><p id="e-admin-hint"></p></div></div>
+              <div class="btn-row">
+                <button class="btn btn-danger" id="btn-end" data-icon="flag">End voting now</button>
+                <button class="btn btn-primary" id="btn-end-expired" data-icon="check">Finalize results</button>
+              </div>
+              <div class="status-line mt-12" id="e-admin-status"></div>
+            </div>
+            <div class="card">
+              <div class="card-head"><div><h3>On-chain</h3><p>Verify everything on the explorer.</p></div></div>
+              <div class="kv" id="e-chain"></div>
+            </div>
           </div>
-        </div>
-        <button id="btn-initiate" class="primary">Initiate election</button>
-        <div id="init-progress" class="progress" hidden></div>
-        <div id="init-result" hidden>
-          <h3>Election live</h3>
-          <div class="kv">
-            <div><span>Component</span><code id="res-component"></code></div>
-            <div><span>Ballot resource</span><code id="res-resource"></code></div>
-            <div><span>Transaction</span><code id="res-txid"></code></div>
-          </div>
-          <h3>Send voters this link</h3>
-          <p class="hint">
-            One link works for every voter — the voting page looks up each connected wallet's own
-            ballot automatically, nothing to fill in by hand.
-          </p>
-          <div class="row">
-            <input id="res-vote-link" type="text" readonly style="flex: 1; min-width: 240px;" />
-            <button id="btn-copy-vote-link" class="ghost">Copy link</button>
-          </div>
-          <h3>Ballot commitments minted</h3>
-          <p class="hint">
-            <strong>This server does not store or serve the address↔ballot mapping</strong> — it
-            only processes the voter addresses once, while building the mint statement, and keeps
-            just the commitments below with no address attached. Voters find their own ballot by
-            connecting their wallet on the voting page and scanning the chain, never by asking this
-            server "which one is mine." This table is just a record of what was minted, for your own
-            bookkeeping.
-          </p>
-          <table class="ballots" id="ballot-table"></table>
-          <button id="btn-ballots-csv" class="ghost">Download ballots CSV</button>
         </div>
       </div>
-    </details>
-
-    <!-- Step 4: monitor -->
-    <details class="step" id="step-monitor">
-      <summary><span class="step-num">4</span> Monitor &amp; results</summary>
-      <div class="step-body">
-        <div id="monitor-empty" class="empty">No election loaded. Initiate one above, or load one from the list.</div>
-        <div id="monitor" hidden>
-          <div class="status-cards">
-            <div class="card"><span class="card-label">Status</span><span class="card-value" id="m-status">…</span></div>
-            <div class="card"><span class="card-label">Epoch</span><span class="card-value" id="m-epoch">…</span></div>
-            <div class="card"><span class="card-label">Deadline</span><span class="card-value" id="m-deadline">…</span></div>
-            <div class="card"><span class="card-label">Ballots cast</span><span class="card-value" id="m-cast">…</span></div>
-            <div class="card"><span class="card-label">Eligible voters</span><span class="card-value" id="m-voters">…</span></div>
-            <div class="card"><span class="card-label">Vault balance</span><span class="card-value" id="m-vault">…</span></div>
-          </div>
-          <div class="row">
-            <button id="btn-refresh" class="ghost">Refresh</button>
-            <button id="btn-end" class="primary">End vote</button>
-            <button id="btn-end-expired" class="ghost">Finalize (expired)</button>
-            <label class="auto"><input type="checkbox" id="in-autopoll" checked /> auto-refresh</label>
-          </div>
-          <div id="m-progress" class="progress" hidden></div>
-          <div id="m-error" class="error" hidden></div>
-          <h3>Results</h3>
-          <div id="m-results"><span class="hint">No results yet — tally is shown once the vote ends.</span></div>
-          <details id="m-raw">
-            <summary>Raw result JSON</summary>
-            <pre id="m-raw-pre"></pre>
-          </details>
-        </div>
-      </div>
-    </details>
+    </section>
   </main>
 
-  <!-- terminal log -->
-  <details class="term" id="term">
-    <summary>Terminal log <span class="badge" id="log-badge">0</span></summary>
-    <div class="term-head">
-      <button id="btn-log-copy" class="ghost">Copy</button>
-      <button id="btn-log-clear" class="ghost">Clear</button>
+  <footer class="site">
+    <div class="shell">
+      <span>Privote runs on the Tari Ootle Esmeralda testnet. Who voted stays private; ballot rankings and the tally are public.</span>
+      <span><a href="/vote">Vote</a> · <a href="https://explorer.tari.mw" target="_blank" rel="noopener">Explorer</a> · <a href="https://github.com/m4r1m0/confidential-vote-template" target="_blank" rel="noopener">Template</a></span>
     </div>
-    <pre id="log" class="log"></pre>
-  </details>
-
-  <!-- CSV modal -->
-  <dialog id="csv-dialog">
-    <form method="dialog" class="csv-form">
-      <h3>Import voters from CSV</h3>
-      <p class="hint">First column: voter address. Optional second column: label (ignored). Header row is skipped if present.</p>
-      <textarea id="csv-text" rows="8" spellcheck="false"
-        placeholder="address,label&#10;otl_esm_1…,Alice&#10;otl_esm_1…,Bob"></textarea>
-      <div class="row">
-        <label class="file-btn">Choose file<input type="file" id="csv-file" accept=".csv,.txt,text/csv" hidden /></label>
-        <button id="csv-apply" class="primary" value="default">Add voters</button>
-        <button value="cancel" class="ghost">Cancel</button>
-      </div>
-      <p class="csv-status" id="csv-status"></p>
-    </form>
-  </dialog>
-
-  <footer>
-    <p>Everything runs on-chain on the Esmeralda testnet. Voter identity is hidden by stealth ballots; ballot contents and the tally are public.</p>
   </footer>
 
+  <script src="/ui.js"></script>
+  <script src="/results.js"></script>
   <script src="/wallet.js"></script>
   <script src="/app.js"></script>
 </body>
