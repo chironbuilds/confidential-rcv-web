@@ -47,6 +47,8 @@
     sparkles: '<path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z"/>',
     calendar: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
     zap: '<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/>',
+    qr: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M14 20h.01M17 17h4v4h-4z"/>',
+    share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.59 13.51 6.83 3.98M15.41 6.51l-6.82 3.98"/>',
     code: '<path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/>',
     home: '<path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/>',
   };
@@ -278,6 +280,7 @@
       };
     }
     mountActivity();
+    window.RcvWallet?.silent();
     loadStatus();
     setInterval(loadStatus, 30000);
   }
@@ -301,6 +304,93 @@
     });
   }
 
+  function qrDialog(url, title) {
+    const d = document.createElement('dialog');
+    d.className = 'modal';
+    let svg = '';
+    try {
+      const qr = window.qrcode(0, 'M');
+      qr.addData(url);
+      qr.make();
+      svg = qr.createSvgTag({ cellSize: 6, margin: 2, scalable: true });
+    } catch {
+      svg = '<p class="muted">QR code unavailable.</p>';
+    }
+    d.innerHTML = `<div class="modal-body center"><h3>${esc(title)}</h3><p>Scan to open the voting page.</p>
+      <div class="qr-box">${svg}</div><code class="tiny muted" style="word-break:break-all">${esc(url)}</code></div>
+      <div class="modal-foot"><button class="btn btn-ghost" value="close">Close</button><button class="btn btn-primary" value="dl">${icon('download')} Download</button></div>`;
+    document.body.appendChild(d);
+    d.querySelectorAll('button').forEach((b) => (b.onclick = () => {
+      if (b.value === 'dl') {
+        const blob = new Blob([d.querySelector('.qr-box svg')?.outerHTML ?? ''], { type: 'image/svg+xml' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'privote-qr.svg';
+        a.click();
+        URL.revokeObjectURL(a.href);
+        return;
+      }
+      d.close();
+    }));
+    d.addEventListener('close', () => d.remove());
+    d.addEventListener('click', (e) => { if (e.target === d) d.close(); });
+    d.showModal();
+  }
+
+  function downloadIcs({ title, startMs, url }) {
+    const f = (ms) => new Date(ms).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+    const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Privote//EN', 'BEGIN:VEVENT',
+      `UID:${Date.now()}@privote`, `DTSTAMP:${f(Date.now())}`, `DTSTART:${f(startMs - 3600e3)}`, `DTEND:${f(startMs)}`,
+      `SUMMARY:Vote closes: ${title.replace(/[,;\n]/g, ' ')}`, `DESCRIPTION:Cast your private ballot before voting closes. ${url}`, `URL:${url}`,
+      'BEGIN:VALARM', 'TRIGGER:-PT0M', 'ACTION:DISPLAY', 'DESCRIPTION:Voting closes in an hour', 'END:VALARM', 'END:VEVENT', 'END:VCALENDAR'];
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([lines.join('\r\n')], { type: 'text/calendar' }));
+    a.download = 'privote-reminder.ics';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  async function share(url, title) {
+    if (navigator.share) {
+      try {
+        await navigator.share({ title, text: `Cast your private ballot: ${title}`, url });
+        return;
+      } catch (e) {
+        if (e?.name === 'AbortError') return;
+      }
+    }
+    copyText(url);
+  }
+
+  /** A blocking "approve in your wallet" card. Returns { step(text, sub), close() }. */
+  function pending(walletName = 'your wallet') {
+    const d = document.createElement('dialog');
+    d.className = 'modal pending-modal';
+    d.innerHTML = `<div class="modal-body center">
+        <div class="pending-orb"><span class="spinner"></span></div>
+        <div class="tiny muted mt-16" data-k="step"></div>
+        <h3 class="mt-8" data-k="title">Waiting for ${esc(walletName)}</h3>
+        <p data-k="sub">Open ${esc(walletName)} and approve the request.</p>
+        <p class="tiny muted mt-16" data-k="timer"></p>
+      </div>`;
+    d.addEventListener('cancel', (e) => e.preventDefault());
+    document.body.appendChild(d);
+    d.showModal();
+    const t0 = Date.now();
+    const timer = setInterval(() => {
+      const s = Math.floor((Date.now() - t0) / 1000);
+      d.querySelector('[data-k="timer"]').textContent = s > 4 ? `${s}s · The request stays open in the wallet until you approve or reject it.` : '';
+    }, 1000);
+    return {
+      step(title, sub = '', step = '') {
+        d.querySelector('[data-k="title"]').textContent = title;
+        d.querySelector('[data-k="sub"]').textContent = sub;
+        d.querySelector('[data-k="step"]').textContent = step;
+      },
+      close() { clearInterval(timer); d.close(); d.remove(); },
+    };
+  }
+
   function confetti(host) {
     const box = document.createElement('div');
     box.className = 'confetti';
@@ -320,6 +410,6 @@
   window.UI = {
     $, $$, esc, icon, hydrateIcons, toast, log, api, copyText, copyBtn, colorFor, initials, avatar, short,
     relTime, fmtDate, splitDuration, METHODS, phaseOf, badge, loadStatus, mountChrome, explorer, confirmDialog,
-    confetti, store, status: () => statusCache,
+    confetti, store, status: () => statusCache, qrDialog, downloadIcs, share, pending,
   };
 })();

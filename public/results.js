@@ -208,7 +208,8 @@
       const pct = (v / max) * 100;
       requestAnimationFrame(() => (row.querySelector('.bar-fill').style.width = `${pct}%`));
       const shown = fmtNum(v / scale);
-      row.querySelector('.b-val').innerHTML = o.out?.has(id) ? '<span class="muted">—</span>' : shown;
+      const pctLabel = o.total ? `<span class="pct">${Math.round((v / o.total) * 100)}%</span>` : '';
+      row.querySelector('.b-val').innerHTML = o.out?.has(id) ? '<span class="muted">—</span>' : `${shown}${pctLabel}`;
       row.title = o.total ? `${shown} votes (${Math.round((v / o.total) * 100)}%)` : `${shown} votes`;
       let q = row.querySelector('.quota-line');
       if (o.quota) {

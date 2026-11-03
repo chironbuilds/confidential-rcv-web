@@ -18,6 +18,7 @@
     if (legacy && h === '/') { location.replace(`/#/e/${legacy}`); return; }
     $$('.view').forEach((v) => (v.hidden = true));
     $$('[data-nav]').forEach((a) => a.classList.remove('active'));
+    $$('.tabbar a').forEach((a) => a.classList.toggle('active', a.dataset.tab === (h === '/new' ? 'new' : h.startsWith('/e/') ? '' : 'home')));
     let m;
     if (h === '/new') {
       show('view-new', 'new');
@@ -72,6 +73,9 @@
         return;
       }
       grid.innerHTML = list.map(({ e, ph }) => card(e, ph)).join('');
+      const open = all.filter((e) => ['open', 'closing'].includes(phaseOf(e, epoch).key)).length;
+      const cast = all.reduce((a, e) => a + (e.ballotCount ?? 0), 0);
+      $('#home-stats').innerHTML = `<span><b>${all.length}</b> election${all.length === 1 ? '' : 's'}</span><span><b>${open}</b> open now</span>${cast ? `<span><b>${cast}</b> private ballot${cast === 1 ? '' : 's'} cast</span>` : ''}`;
     }
     function card(e, ph) {
       const m = METHODS[e.tallyMethod] ?? METHODS.irv;
@@ -83,7 +87,8 @@
         <div class="e-top">${badge(ph)}<span class="e-method">${esc(m.short)}${e.numWinners > 1 ? ` · ${e.numWinners} seats` : ''}</span></div>
         <h3>${esc(e.title)}</h3>
         <div class="avatars">${shown}${more}</div>
-        <div class="e-meta"><span>${icon('users')}${e.voters?.length ?? 0} voters</span><span>${icon('clock')}${esc(when)}</span></div>
+        <div class="e-meta"><span>${icon('users')}${e.ballotCount != null ? `${e.ballotCount}/` : ''}${e.voters?.length ?? 0} ${e.ballotCount != null ? 'voted' : 'voters'}</span><span>${icon('clock')}${esc(when)}</span></div>
+        ${e.ballotCount != null ? `<div class="e-progress" title="Turnout"><span style="width:${Math.round((e.ballotCount / Math.max(1, e.voters?.length ?? 1)) * 100)}%"></span></div>` : ''}
       </a>`;
     }
     $('#btn-refresh-list').onclick = enter;
@@ -239,16 +244,16 @@
       sync();
     });
     $('#btn-init-connect').onclick = async () => {
-      if (!window.tari) return toast('No Tari wallet found', 'Install Sapient, or open Privote inside Tari Universe.', 'err');
       try {
-        const [account] = await window.tari.request({ method: 'tari_requestAccounts' });
-        s.walletAccount = account;
-        toast('Wallet connected', short(account, 14, 8), 'ok');
+        const w = await window.RcvWallet.connect();
+        s.walletAccount = w.account;
+        toast(`Connected to ${w.name}`, short(w.address ?? w.account, 14, 8), 'ok');
         sync();
       } catch (e) {
-        toast('Wallet connection failed', e?.message || String(e), 'err');
+        toast(e.message === 'NO_WALLET' ? 'No Tari wallet found' : 'Wallet connection failed', e.message === 'NO_WALLET' ? 'Install Sapient, or open Privote inside Tari Universe.' : e.message, 'err');
       }
     };
+    window.RcvWallet.onChange((w) => { s.walletAccount = w.account; sync(); });
 
     // ---- validation ----
     function checks() {
@@ -318,7 +323,11 @@
       // signer
       $$('#signer-choices .choice').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.signer === s.signer)));
       $('#wallet-row').hidden = s.signer !== 'wallet';
-      $('#init-wallet-account').textContent = s.walletAccount ? `Connected ${short(s.walletAccount, 14, 8)}` : 'Not connected';
+      const ws = window.RcvWallet.state();
+      $('#btn-init-connect').hidden = !!s.walletAccount;
+      $('#init-wallet-account').innerHTML = s.walletAccount
+        ? `${icon('check', 'inline-svg')} ${esc(ws.name ?? 'Wallet')} connected · <code>${esc(short(ws.address ?? s.walletAccount, 12, 6))}</code>`
+        : ws.available ? 'Connect to sign with your own wallet.' : 'No Tari wallet detected in this browser. <a href="https://sapient.tari.mw" target="_blank" rel="noopener">Get Sapient</a>';
       $('#launch-summary').innerHTML = `<div class="p-rows">
         <div class="p-row"><span>Title</span><span>${esc(s.title || '—')}</span></div>
         <div class="p-row"><span>Method</span><span>${esc(m.name)}${m.multi ? `, ${s.winners} seats` : ''}</span></div>
@@ -411,8 +420,16 @@
         if (s.signer === 'wallet') {
           setStatus('<span class="spinner"></span> Building the ballots…');
           const prep = await api('/api/elections/prepare', { method: 'POST', body });
-          setStatus('<span class="spinner"></span> Approve the transaction in your wallet…');
-          const result = await window.RcvWallet.submitTransactionRequest({ kind: 'instructions', instructions: prep.instructions, maxFee: prep.maxFee });
+          const p = UI.pending(window.RcvWallet.state().name);
+          p.step(`Approve the election in ${window.RcvWallet.state().name}`, `Creates the election and mints ${c.v.valid.length} stealth ballot${c.v.valid.length === 1 ? '' : 's'}. Your wallet pays the fee.`);
+          let result;
+          try {
+            result = await window.RcvWallet.submitTransactionRequest({ kind: 'instructions', instructions: prep.instructions, maxFee: prep.maxFee }, {
+              onSubmitting: () => p.step('Creating your election…', 'Waiting for the network to confirm.'),
+            });
+          } finally {
+            p.close();
+          }
           const transactionId = extractTxId(result);
           if (!transactionId) throw new Error('The wallet did not return a transaction id.');
           setStatus('<span class="spinner"></span> Confirming on-chain…');
@@ -435,12 +452,25 @@
       }
     }
 
+    function loadFrom(e) {
+      Object.assign(s, {
+        step: 0,
+        title: `${e.title} (again)`.slice(0, 200),
+        method: e.tallyMethod in METHODS ? e.tallyMethod : 'irv',
+        winners: Math.max(2, e.numWinners || 2),
+        candidates: [...(e.candidates ?? [])],
+        votersText: '',
+        deadline: { preset: '3d', custom: '' },
+      });
+      save();
+    }
+
     function enter() {
       UI.loadStatus().then(sync);
       sync();
       setTimeout(() => { if (s.step === 0 && !s.title) $('#in-title').focus(); }, 60);
     }
-    return { enter };
+    return { enter, loadFrom };
   })();
 
   // =====================================================================
@@ -519,8 +549,16 @@
       const link = `${location.origin}/vote?election=${encodeURIComponent(e.id)}`;
       $('#e-link').textContent = link;
       $('#btn-copy-link').onclick = (ev) => UI.copyText(link, ev.currentTarget);
+      const votingOpen = ph.key === 'open' || ph.key === 'closing';
       $('#e-vote-btn').href = link;
-      $('#e-vote-btn').hidden = ph.key === 'ended' || ph.key === 'expired';
+      $('#e-vote-btn').hidden = !votingOpen;
+      $('#e-hero-vote').href = link;
+      $('#e-hero-vote').hidden = !votingOpen;
+      $('#btn-qr').onclick = () => UI.qrDialog(link, e.title);
+      $('#btn-share').onclick = () => UI.share(link, e.title);
+      $('#btn-ics').hidden = !votingOpen || !ph.endsAt;
+      $('#btn-ics').onclick = () => UI.downloadIcs({ title: e.title, startMs: ph.endsAt, url: link });
+      $('#btn-clone').onclick = () => { Wizard.loadFrom(e); location.hash = '#/new'; };
 
       // admin
       const isServerInitiated = !e.initiator || e.initiator === 'server';

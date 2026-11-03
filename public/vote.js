@@ -38,7 +38,7 @@
   const utxoId = (resource, commitment) => `utxo_${resource.replace('resource_', '')}_${commitment}`;
   async function isLive(resource, commitment) {
     try {
-      const res = await window.tari.request({ method: 'tari_getSubstate', params: { substateId: utxoId(resource, commitment), version: null } });
+      const res = await window.RcvWallet.call('tari_getSubstate', { substateId: utxoId(resource, commitment), version: null });
       if (res?.state && !('up' in res.state)) return false;
       const value = res?.state?.up?.substate ?? res?.substate;
       const utxo = value?.Utxo ?? value?.substate?.Utxo;
@@ -47,11 +47,8 @@
       return false;
     }
   }
-  async function ensureView() {
-    let r = await window.tari.request({ method: 'tari_getViewAccess' });
-    if (!r?.granted) r = await window.tari.request({ method: 'tari_requestViewAccess' });
-    if (!r?.granted) throw new Error('Private view access is needed so your wallet can look for your ballot.');
-  }
+  const ensureView = () => window.RcvWallet.ensureView();
+  const walletName = () => window.RcvWallet.state().name || 'your wallet';
   function rankingCbor(ids) {
     const head = (n) => (n < 24 ? [n] : n < 256 ? [0x18, n] : [0x19, n >> 8, n & 255]);
     const bytes = [...(ids.length < 24 ? [0x80 | ids.length] : [0x98, ids.length]), ...ids.flatMap(head)];
@@ -76,7 +73,7 @@
     $('#ballot').hidden = false;
     $('#v-badges').innerHTML = `${badge(ph)}<span class="badge outline">${esc(m.name)}</span>`;
     $('#v-title').textContent = e.title;
-    $('#v-sub').innerHTML = `${(e.candidates ?? []).length} candidates${e.numWinners > 1 ? ` · ${e.numWinners} seats` : ''} · ${ph.endsAt ? `closes ${esc(relTime(ph.endsAt))} (${esc(fmtDate(ph.endsAt))})` : `closes at epoch ${e.expiresAtEpoch}`}`;
+    $('#v-sub').innerHTML = `${(e.candidates ?? []).length} candidates${e.numWinners > 1 ? ` · ${e.numWinners} seats` : ''} · ${ph.key === 'ended' ? 'voting has ended' : ph.key === 'expired' ? 'voting has closed' : ph.endsAt ? `closes ${esc(relTime(ph.endsAt))} (${esc(fmtDate(ph.endsAt))})` : `closes at epoch ${e.expiresAtEpoch}`}`;
     $('#done-results').href = `/#/e/${encodeURIComponent(e.id)}`;
     $('#v-results-link').href = `/#/e/${encodeURIComponent(e.id)}`;
     if (ph.key === 'ended' || ph.key === 'expired') {
@@ -86,10 +83,29 @@
     }
     v.order = (e.candidates ?? []).map((_, i) => i);
     setupRanking(m);
-    if (!window.tari) {
-      // tari-connector.js may still be injecting window.tari inside Universe.
-      setTimeout(() => { if (!window.tari) $('#no-wallet').hidden = false; }, 1200);
+    const w = await window.RcvWallet.silent();
+    if (!w.available) {
+      $('#no-wallet').hidden = false;
+      $('#btn-connect').hidden = true;
+      return;
     }
+    $('#btn-connect').innerHTML = `${icon('wallet')} Connect ${esc(w.name)}`;
+    if (w.connected) onConnected(w);
+    window.RcvWallet.onChange((s) => {
+      if (!s.connected) {
+        v.wallet = null;
+        v.ballot = null;
+        $('#s1-sub').textContent = 'Sapient or Tari Universe. Privote never sees your keys.';
+        setStep('connect');
+      } else if (s.address && s.address !== v.wallet) onConnected(s);
+    });
+  }
+
+  function onConnected(w) {
+    v.wallet = w.address || w.account;
+    $('#s1-sub').innerHTML = `<span class="wallet-chip">${avatar(v.wallet.slice(8), 5)}${esc(short(v.wallet, 12, 6))}</span> <span class="small muted">via ${esc(w.name)}</span>`;
+    setStep('find');
+    findBallot();
   }
 
   async function showPicker() {
@@ -109,24 +125,18 @@
 
   // ---------- 1 connect ----------
   $('#btn-connect').onclick = async () => {
-    if (!window.tari) {
-      $('#no-wallet').hidden = false;
-      return;
-    }
     const btn = $('#btn-connect');
+    const label = btn.innerHTML;
     btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span> Waiting for wallet…';
+    btn.innerHTML = `<span class="spinner"></span> Approve in ${esc(walletName())}…`;
     try {
-      await window.tari.request({ method: 'tari_requestAccounts' });
-      v.wallet = await window.tari.request({ method: 'tari_getWalletAddress' });
-      $('#s1-sub').innerHTML = `<span class="wallet-chip">${avatar(v.wallet.slice(8), 3)}${esc(short(v.wallet, 12, 6))}</span>`;
-      setStep('find');
-      findBallot();
+      onConnected(await window.RcvWallet.connect());
     } catch (e) {
-      toast('Could not connect', e?.message || String(e), 'err');
+      if (e.message === 'NO_WALLET') $('#no-wallet').hidden = false;
+      else toast('Could not connect', e.message, 'err');
     } finally {
       btn.disabled = false;
-      btn.innerHTML = `${icon('wallet')} Connect wallet`;
+      btn.innerHTML = label;
     }
   };
 
@@ -137,17 +147,14 @@
     $('#find-actions').hidden = true;
     setStep('find');
     try {
-      status(st, spin('Asking your wallet for permission to read private outputs…'));
+      status(st, spin(`Asking ${walletName()} for permission to look for your ballot…`));
       await ensureView();
       status(st, spin('Checking your wallet…'));
-      const known = await window.tari.request({ method: 'tari_getShieldedOutputs', params: { resourceAddress: e.ballotResource } });
+      const known = await window.RcvWallet.call('tari_getShieldedOutputs', { resourceAddress: e.ballotResource });
       let match = known?.[0];
       if (!match) {
         status(st, spin('Scanning the election’s mint transaction for a ballot addressed to you…'));
-        const { found } = await window.tari.request({
-          method: 'tari_scanForResourceUtxos',
-          params: { resourceAddress: e.ballotResource, transactionIds: e.txId ? [e.txId] : [], maxPages: 20, pageSize: 50, limit: 1 },
-        });
+        const { found } = await window.RcvWallet.call('tari_scanForResourceUtxos', { resourceAddress: e.ballotResource, transactionIds: e.txId ? [e.txId] : [], maxPages: 20, pageSize: 50, limit: 1 });
         match = found?.[0];
       }
       if (!match) {
@@ -168,7 +175,7 @@
       setStep('rank');
       prepareFee();
     } catch (err) {
-      status(st, errLine(esc(err?.message || String(err))), 'err');
+      status(st, errLine(esc(window.RcvWallet.friendly(err))), 'err');
       $('#find-actions').hidden = false;
       setStep('find', { blocked: true });
     }
@@ -176,8 +183,19 @@
   $('#btn-rescan').onclick = findBallot;
 
   // ---------- 3 rank ----------
+  const EXPLAIN = {
+    irv: [['repeat', 'Your top choice gets your vote first.'], ['split', 'If they are eliminated, your vote moves to your next choice, so ranking everyone never hurts.'], ['trophy', 'Counting stops when someone has a majority.']],
+    'sequential-irv': [['repeat', 'Each seat is filled by an instant runoff.'], ['layers', 'Once someone wins a seat, they are removed and the next seat is counted from everyone’s rankings.'], ['trophy', 'Your lower choices matter for the later seats.']],
+    stv: [['target', 'Candidates who reach the quota are elected.'], ['split', 'Votes beyond the quota, and votes for eliminated candidates, move to the next choice.'], ['trophy', 'Seats end up shared in proportion to support.']],
+    fptp: [['target', 'You get one choice.'], ['trophy', 'The option with the most votes wins. A tie has no winner.']],
+  };
+  function drawExplain(method) {
+    $('#explain').innerHTML = `<div class="small" style="font-weight:650;color:var(--text)">How your vote counts</div>` + (EXPLAIN[method] ?? EXPLAIN.irv).map(([ic, t]) => `<div class="ex-row">${icon(ic)}<span>${esc(t)}</span></div>`).join('');
+  }
+
   function setupRanking(m) {
     const names = v.election.candidates ?? [];
+    drawExplain(v.election.tallyMethod);
     if (!m.ranked) {
       $('#rank-ui').hidden = true;
       $('#pick-ui').hidden = false;
@@ -330,7 +348,7 @@
     $('#fee-actions').hidden = true;
     const saved = UI.store.get(FEE_KEY);
     try {
-      const outputs = (await window.tari.request({ method: 'tari_getShieldedOutputs', params: { resourceAddress: XTR } })) ?? [];
+      const outputs = (await window.RcvWallet.call('tari_getShieldedOutputs', { resourceAddress: XTR })) ?? [];
       const sorted = [...outputs].sort((a, b) => (BigInt(b.amount) > BigInt(a.amount) ? 1 : -1));
       if (saved && !sorted.some((o) => o.commitment === saved)) sorted.unshift({ commitment: saved, amount: '0' });
       for (const o of sorted) {
@@ -342,8 +360,15 @@
       }
     } catch { /* fall through to shield */ }
     v.fee = null;
-    status(st, `${icon('info')} You need a little shielded TARI so the fee can’t be traced to you.`);
-    $('#fee-actions').hidden = false;
+    const bal = await window.RcvWallet.publicXtr();
+    const need = BigInt(FEE_SHIELD) + 200000n;
+    if (bal != null && bal < need) {
+      status(st, errLine(`Your wallet needs about ${(Number(need) / 1e6).toFixed(1)} tTARI to pay the fee privately. It has ${(Number(bal) / 1e6).toFixed(2)}.`), 'err');
+      v.feeBlocked = true;
+    } else {
+      v.feeBlocked = false;
+      status(st, `${icon('shield')} First, 0.5 tTARI will be moved into your private balance to pay fees, so nothing links this vote to you. You'll approve twice.`);
+    }
     updateCastButton();
   }
   function setFee(commitment, amount) {
@@ -375,7 +400,16 @@
     }
   };
   function updateCastButton() {
-    $('#btn-cast').disabled = !(v.ballot && v.fee && v.step === 'cast');
+    $('#btn-cast').disabled = !(v.ballot && v.step === 'cast' && (v.fee || !v.feeBlocked));
+    $('#btn-cast').innerHTML = `${icon('vote')} ${v.fee ? 'Cast ballot' : 'Cast ballot privately'}`;
+  }
+
+  async function shieldFee(p) {
+    p.step(`Approve the private fee in ${walletName()}`, 'Moves 0.5 tTARI into your private balance. This covers fees for several votes.', 'Step 1 of 2');
+    const r = await window.RcvWallet.submitTransactionRequest({ kind: 'shield', resourceAddress: XTR, amount: FEE_SHIELD }, {
+      onSubmitting: () => p.step('Shielding…', 'Waiting for the network to confirm.', 'Step 1 of 2'),
+    });
+    setFee(r.commitment, FEE_SHIELD);
   }
 
   $('#btn-cast').onclick = async () => {
@@ -385,11 +419,15 @@
     const btn = $('#btn-cast');
     const st = $('#cast-status');
     btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span> Casting…';
+    status(st, '');
+    let p = null;
     try {
-      const caps = await window.tari.request({ method: 'tari_getCapabilities' });
+      const caps = await window.RcvWallet.call('tari_getCapabilities');
       if (!caps?.stealthRedeemPrivateFee) throw new Error('This wallet cannot pay fees privately yet. Update Sapient or Tari Universe and try again.');
-      status(st, spin('Approve the ballot in your wallet…'));
+      p = UI.pending(walletName());
+      const twoStep = !v.fee;
+      if (twoStep) await shieldFee(p);
+      p.step(`Approve your ballot in ${walletName()}`, 'Your ranking is sent with a one-time key. Nothing ties it to your wallet.', twoStep ? 'Step 2 of 2' : '');
       const result = await window.RcvWallet.submitTransactionRequest({
         kind: 'redeemStealthOutputWithPrivateFee',
         resourceAddress: e.ballotResource,
@@ -400,7 +438,9 @@
         feeCommitmentHex: v.fee,
         maxFee: MAX_FEE,
         relatedComponents: [e.componentAddress],
-      });
+      }, { onSubmitting: () => p.step('Casting your ballot…', 'Waiting for the network to confirm.', twoStep ? 'Step 2 of 2' : '') });
+      p.close();
+      p = null;
       if (result?.feeChangeCommitment) UI.store.set(FEE_KEY, result.feeChangeCommitment);
       status(st, '');
       $('#vflow').hidden = true;
@@ -411,7 +451,8 @@
       UI.confetti($('#done'));
       $('#done').scrollIntoView({ behavior: 'smooth', block: 'center' });
     } catch (err) {
-      const msg = err?.message || String(err);
+      p?.close();
+      const msg = window.RcvWallet.friendly(err);
       if (/is down|already spent/i.test(msg) && v.fee && msg.includes(v.fee)) {
         UI.store.del(FEE_KEY);
         v.fee = null;
@@ -421,7 +462,6 @@
         status(st, errLine(esc(msg)), 'err');
       }
     } finally {
-      btn.innerHTML = `${icon('vote')} Cast ballot`;
       updateCastButton();
     }
   };

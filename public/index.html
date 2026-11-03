@@ -6,6 +6,10 @@
   <title>Privote · Private voting on Tari</title>
   <meta name="description" content="Confidential ranked-choice voting on Tari Ootle. Stealth ballots keep who voted private; the tally runs on-chain." />
   <meta name="theme-color" content="#07080f" />
+  <meta property="og:title" content="Privote · Private voting on Tari" />
+  <meta property="og:description" content="Ranked-choice elections with stealth ballots. Nobody can link a vote to a wallet, and the count runs on-chain." />
+  <meta property="og:type" content="website" />
+  <meta name="twitter:card" content="summary" />
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -29,6 +33,7 @@
       </nav>
       <div class="topbar-right">
         <span class="net-chip" id="net-chip"><span class="dot"></span> connecting…</span>
+        <span id="wallet-chip"></span>
         <button class="icon-btn" id="btn-theme" aria-label="Toggle theme"></button>
       </div>
     </div>
@@ -68,6 +73,7 @@
       <div class="section-title"><h2>Elections</h2>
         <div class="btn-row"><button class="btn btn-sm btn-ghost" id="btn-refresh-list" data-icon="refresh">Refresh</button></div>
       </div>
+      <div class="home-stats" id="home-stats"></div>
       <div class="pills" id="filter-pills" role="group" aria-label="Filter elections">
         <button class="pill-btn" data-filter="all" aria-pressed="true">All</button>
         <button class="pill-btn" data-filter="open" aria-pressed="false">Open</button>
@@ -204,7 +210,10 @@
             <h1 class="mt-12" id="e-title"></h1>
             <div class="sub" id="e-sub"></div>
           </div>
-          <div class="countdown" id="e-countdown"></div>
+          <div class="e-hero-right">
+            <div class="countdown" id="e-countdown"></div>
+            <a class="btn btn-primary btn-lg" id="e-hero-vote" data-icon="vote">Vote now</a>
+          </div>
         </div>
 
         <div class="stats">
@@ -238,6 +247,11 @@
             <div class="card">
               <div class="card-head"><div><h3>Invite voters</h3><p>One link for everyone. Each wallet finds its own ballot.</p></div></div>
               <div class="share-box"><code id="e-link"></code><button class="btn btn-sm btn-primary" id="btn-copy-link" data-icon="copy">Copy</button></div>
+              <div class="grid grid-3 mt-12 share-actions">
+                <button class="btn btn-sm" id="btn-qr" data-icon="qr">QR code</button>
+                <button class="btn btn-sm" id="btn-share" data-icon="share">Share</button>
+                <button class="btn btn-sm" id="btn-ics" data-icon="calendar">Reminder</button>
+              </div>
               <a class="btn btn-block mt-12" id="e-vote-btn" data-icon="vote">Open voting page</a>
             </div>
             <div class="card" id="e-admin">
@@ -248,7 +262,8 @@
               </div>
               <div class="status-line mt-12" id="e-admin-status"></div>
             </div>
-            <div class="card">
+            <button class="btn btn-ghost btn-block mt-16" id="btn-clone" data-icon="repeat">Run a similar election</button>
+            <div class="card mt-16">
               <div class="card-head"><div><h3>On-chain</h3><p>Verify everything on the explorer.</p></div></div>
               <div class="kv" id="e-chain"></div>
             </div>
@@ -258,6 +273,11 @@
     </section>
   </main>
 
+  <nav class="tabbar" aria-label="Main">
+    <a href="/#/" data-tab="home"><span data-icon="home"></span>Elections</a>
+    <a href="/#/new" data-tab="new"><span data-icon="plus"></span>Create</a>
+    <a href="/vote" data-tab="vote"><span data-icon="vote"></span>Vote</a>
+  </nav>
   <footer class="site">
     <div class="shell">
       <span>Privote runs on the Tari Ootle Esmeralda testnet. Who voted stays private; ballot rankings and the tally are public.</span>
@@ -265,6 +285,7 @@
     </div>
   </footer>
 
+  <script src="/vendor/qrcode.js"></script>
   <script src="/ui.js"></script>
   <script src="/results.js"></script>
   <script src="/wallet.js"></script>

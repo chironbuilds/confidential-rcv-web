@@ -143,6 +143,7 @@ const MIME = {
 const STATIC = new Set(['app.js', 'style.css', 'vote.js', 'wallet.js', 'ui.js', 'results.js', 'favicon.svg']);
 // The tally WASM is also served so browsers can recount the public ballots themselves.
 const TALLY = { '/tally/rcv_tally_wasm.js': 'text/javascript', '/tally/rcv_tally_wasm_bg.wasm': 'application/wasm' };
+const VENDOR = { '/vendor/qrcode.js': 'node_modules/qrcode-generator/qrcode.js' };
 
 function sendJson(res, status, obj) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -181,6 +182,11 @@ const server = createServer(async (req, res) => {
     // static
     if ((req.method === 'GET' || req.method === 'HEAD') && (p === '/' || p === '/index.html')) return serveStatic(req, res, 'index.html');
     if ((req.method === 'GET' || req.method === 'HEAD') && STATIC.has(p.slice(1))) return serveStatic(req, res, p.slice(1));
+    if ((req.method === 'GET' || req.method === 'HEAD') && VENDOR[p]) {
+      const data = await readFile(path.join(ROOT, VENDOR[p]));
+      res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'public, max-age=86400' });
+      return res.end(data);
+    }
     if ((req.method === 'GET' || req.method === 'HEAD') && TALLY[p]) {
       const data = await readFile(path.join(ROOT, 'lib', p));
       res.writeHead(200, { 'Content-Type': TALLY[p], 'Cache-Control': 'public, max-age=3600' });
@@ -379,7 +385,11 @@ const server = createServer(async (req, res) => {
 
     // list elections
     if (req.method === 'GET' && p === '/api/elections') {
-      return sendJson(res, 200, visible().map(publicElection));
+      return sendJson(res, 200, visible().map((e) => {
+        const hit = stateCache.get(e.id)?.value;
+        const ballotCount = hit && !(hit instanceof Promise) && !hit.error ? hit.ballotCount : undefined;
+        return { ...publicElection(e), ballotCount };
+      }));
     }
 
     // single election + live state

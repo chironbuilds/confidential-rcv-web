@@ -14,7 +14,8 @@
     "@tari-project/ootle-indexer": "^0.13.0",
     "@tari-project/ootle-secret-key-wallet": "^0.13.0",
     "@tari-project/ootle-wasm": "^0.49.2",
-    "@tari-project/ootle-wasm-bor": "^0.49.2"
+    "@tari-project/ootle-wasm-bor": "^0.49.2",
+    "qrcode-generator": "^1.4.4"
   },
   "engines": {
     "node": ">=22"
