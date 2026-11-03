@@ -2,10 +2,10 @@
 // Serves the static front end and a small JSON API for the election lifecycle.
 // The initiator's wallet keys live in config.env (gitignored).
 import { readFile } from 'node:fs/promises';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { createServer } from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { generateOotleSecretKey } from '@tari-project/ootle-wasm';
 import {
   MAX_VOTERS,
@@ -162,9 +162,20 @@ function readBody(req) {
   });
 }
 
+// Cloudflare in front of the site gives JS/CSS a long browser TTL, so every asset URL in the HTML
+// carries a content hash: a deploy changes the URL and nobody gets new HTML with stale scripts.
+const BUILD = (() => {
+  const h = createHash('sha256');
+  for (const f of readdirSync(PUBLIC_DIR).sort()) h.update(f).update(readFileSync(path.join(PUBLIC_DIR, f)));
+  h.update(readFileSync(path.join(ROOT, 'lib', 'tally', 'rcv_tally_wasm_bg.wasm')));
+  return h.digest('hex').slice(0, 10);
+})();
+const stamp = (html) => html.replace(/(src|href)="(\/(?:[\w.-]+\/)?[\w.-]+\.(?:js|css|svg))"/g, `$1="$2?v=${BUILD}"`);
+
 async function serveStatic(req, res, rel) {
   try {
-    const data = await readFile(path.join(PUBLIC_DIR, rel));
+    let data = await readFile(path.join(PUBLIC_DIR, rel));
+    if (rel.endsWith('.html')) data = stamp(data.toString('utf8'));
     res.writeHead(200, {
       'Content-Type': MIME[path.extname(rel)] || 'text/plain',
       'Cache-Control': 'no-cache',
@@ -208,6 +219,7 @@ const server = createServer(async (req, res) => {
         walletAddress: ctx.address,
         epochDurationSecs: EPOCH_DURATION_SECS,
         maxVoters: MAX_VOTERS,
+        build: BUILD,
         elections: visible().length,
       });
     }

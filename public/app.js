@@ -624,7 +624,7 @@
       st.innerHTML = '<span class="spinner"></span> Loading the tally code…';
       try {
         if (!tallyMod) {
-          tallyMod = await import('/tally/rcv_tally_wasm.js');
+          tallyMod = await import(`/tally/rcv_tally_wasm.js?v=${UI.status()?.build ?? ''}`);
           await tallyMod.default('/tally/rcv_tally_wasm_bg.wasm');
         }
         const t0 = performance.now();
