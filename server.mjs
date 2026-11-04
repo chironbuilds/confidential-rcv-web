@@ -91,6 +91,17 @@ let elections = loadElections();
 // Elections from before an Ootle network reset point at a template that no longer exists. They are
 // kept in the data file but hidden from the site.
 const isCurrent = (e) => e.templateAddress === cfg.TEMPLATE_ADDRESS;
+
+// A transient indexer hiccup on the epoch lookup must not turn into a 500 for the page.
+let lastEpoch = null;
+async function safeEpoch() {
+  try {
+    lastEpoch = await currentEpoch(ctx);
+  } catch (err) {
+    if (lastEpoch == null) throw err;
+  }
+  return lastEpoch;
+}
 const visible = () => elections.filter(isCurrent);
 
 // Live state is read with four dry-runs per election; cache it briefly so many viewers polling the
@@ -209,7 +220,7 @@ const server = createServer(async (req, res) => {
 
     // status
     if (req.method === 'GET' && p === '/api/status') {
-      const epoch = await currentEpoch(ctx);
+      const epoch = await safeEpoch();
       return sendJson(res, 200, {
         network: cfg.NETWORK,
         indexerUrl: ctx.indexerUrl,
@@ -241,7 +252,7 @@ const server = createServer(async (req, res) => {
       const voterAddresses = (Array.isArray(body.voters) ? body.voters : [])
         .map((v) => String(v).trim())
         .filter((v) => /^otl_esm_/.test(v));
-      const epoch = await currentEpoch(ctx);
+      const epoch = await safeEpoch();
       let expiresInEpochs;
       if (body.endUtc) {
         expiresInEpochs = Math.max(1, Math.min(100_000, utcToEpochDelta(body.endUtc, epoch)));
@@ -409,7 +420,7 @@ const server = createServer(async (req, res) => {
     if (oneMatch && req.method === 'GET') {
       const e = visible().find((x) => x.id === oneMatch[1]);
       if (!e) return sendJson(res, 404, { error: 'not found' });
-      const epoch = await currentEpoch(ctx);
+      const epoch = await safeEpoch();
       // Keep the deadline anchored to the recorded wall-clock time; re-deriving it from the epoch on
       // every request makes it drift with epoch-length jitter.
       const fresh = { ...publicElection(e), expiresAtUtc: e.expiresAtUtc ?? epochToUtc(e.expiresAtEpoch, epoch) };

@@ -166,7 +166,7 @@
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       log(`<span class="err">✗ ${res.status}</span> ${esc(JSON.stringify(data))}`, 'err');
-      throw new Error(data.error || `HTTP ${res.status}`);
+      throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { status: res.status });
     }
     if (!opts.quiet) log(`<span class="ok">✓</span> ${esc(JSON.stringify(data).slice(0, 220))}`);
     return data;

@@ -51,6 +51,7 @@ window.RcvWallet = (function () {
     if (/reject|denied|declined|cancel/i.test(msg)) return 'You declined the request in your wallet.';
     if (/No wallet set up/i.test(msg)) return 'Set up your wallet first, then come back.';
     if (/insufficient|not enough|exceeds/i.test(msg)) return 'Your wallet does not have enough tTARI for this.';
+    if (/as its main signer, but .* did not sign/i.test(msg)) return 'Your wallet version cannot cast private ballots on this network yet. Update Sapient to 0.7.2 or newer, then try again. Your ballot and fee are untouched.';
     if (/timed out/i.test(msg)) return 'The wallet did not respond in time. Open it and check for a pending request.';
     return msg || 'Something went wrong in the wallet.';
   }

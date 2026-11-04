@@ -443,6 +443,7 @@
         Object.assign(s, { step: 0, title: '', candidates: [], votersText: '', busy: false });
         setStatus('');
         toast('Your election is live', 'Share the voting link with your voters.', 'ok', 6000);
+        Election.prime(e);
         location.hash = `#/e/${encodeURIComponent(e.id)}?new=1`;
       } catch (err) {
         s.busy = false;
@@ -481,21 +482,35 @@
     let poll = null;
     let tick = null;
     let lastResultJson = '';
+    let primed = null;
+    let retry = null;
+    let firstTry = 0;
+
+    /** Hand over a just-created election so its page renders instantly, before the server read lands. */
+    const prime = (e) => { primed = e; };
 
     function enter(id) {
       current = null;
       lastResultJson = '';
+      firstTry = Date.now();
       $('#e-loading').hidden = false;
+      $('#e-loading-msg').textContent = '';
       $('#e-body').hidden = true;
       $('#e-missing').hidden = true;
       const isNew = location.hash.includes('new=1');
+      if (primed?.id === id) {
+        current = primed;
+        draw(primed);
+      }
+      primed = null;
       load(id, isNew);
       poll = setInterval(() => load(id), 8000);
       tick = setInterval(drawCountdown, 1000);
-      return () => { clearInterval(poll); clearInterval(tick); };
+      return () => { clearInterval(poll); clearInterval(tick); clearTimeout(retry); };
     }
 
     async function load(id, celebrate = false) {
+      clearTimeout(retry);
       try {
         const e = await api(`/api/elections/${encodeURIComponent(id)}`, { quiet: !!current });
         const before = current?.id === e.id ? current?.state?.ballotCount : undefined;
@@ -510,10 +525,18 @@
           history.replaceState(null, '', `#/e/${encodeURIComponent(id)}`);
         }
       } catch (err) {
-        if (!current) {
+        if (current) return;
+        // A brand-new election can take a few seconds to show up everywhere; keep the skeleton up and
+        // retry quickly instead of flashing "not found". Only give up on a definite 404 after a while.
+        const waited = Date.now() - firstTry;
+        const gaveUp = err.status === 404 ? waited > (celebrate || location.hash.includes('new=1') ? 30000 : 4000) : waited > 60000;
+        if (gaveUp) {
           $('#e-loading').hidden = true;
           $('#e-missing').hidden = false;
+          return;
         }
+        $('#e-loading-msg').innerHTML = waited > 2500 ? '<span class="spinner"></span> Syncing with the network…' : '';
+        retry = setTimeout(() => load(id, celebrate), 1500);
       }
     }
 
@@ -692,7 +715,7 @@
       a.click();
       URL.revokeObjectURL(a.href);
     };
-    return { enter };
+    return { enter, prime };
   })();
 
   route();
