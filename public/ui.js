@@ -286,9 +286,9 @@
   }
 
   const explorer = {
-    tx: (id) => `https://explorer.tari.mw/tx/${encodeURIComponent(id)}`,
-    substate: (id) => `https://explorer.tari.mw/substate/${encodeURIComponent(id)}`,
-    template: (id) => `https://explorer.tari.mw/template/${encodeURIComponent(id)}`,
+    tx: (id) => `https://testnet-explorer.tari.mw/tx/${encodeURIComponent(id)}`,
+    substate: (id) => `https://testnet-explorer.tari.mw/substate/${encodeURIComponent(id)}`,
+    template: (id) => `https://testnet-explorer.tari.mw/template/${encodeURIComponent(id)}`,
   };
 
   function confirmDialog({ title, body, confirm = 'Confirm', danger = false }) {
